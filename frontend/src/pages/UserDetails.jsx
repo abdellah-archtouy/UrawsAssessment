@@ -106,14 +106,14 @@ function UserDetails() {
             onClick={() => setIsEditModalOpen(true)}
             disabled={updateMutation.isPending}
           >
-            ✏️ Edit User
+            Edit User
           </button>
           <button
             className="btn btn-danger"
             onClick={() => setShowDeleteConfirm(true)}
             disabled={deleteMutation.isPending}
           >
-            🗑️ Delete User
+            Delete User
           </button>
         </div>
       </div>
