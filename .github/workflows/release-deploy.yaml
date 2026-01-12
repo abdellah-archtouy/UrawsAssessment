@@ -1,12 +1,8 @@
-name: Simple Deployment Pipeline
+name: Full CI/CD Pipeline
 on:
   push:
     branches: [release]
     paths: [deploy-trigger.txt]
-
-env:
-  DOCKERHUB_USERNAME: 'aarchtou'
-  AWS_REGION: 'us-east-1'
 
 jobs:
   deploy:
@@ -17,84 +13,308 @@ jobs:
       run: |
         SHA=$(git ls-remote https://github.com/${{ github.repository }} refs/heads/main | cut -f1 | head -c 8)
         echo "sha=$SHA" >> $GITHUB_OUTPUT
-        echo "✅ Main SHA: $SHA"
+        echo "Main branch SHA: $SHA"
+    
+    - name: Checkout Release Branch for Scripts
+      uses: actions/checkout@v4
+      with:
+        ref: release
+        path: ./release-scripts
+    
+    - name: Checkout Main Branch for Code
+      uses: actions/checkout@v4
+      with:
+        ref: main
+        path: ./app-code
     
     - name: Configure AWS
       uses: aws-actions/configure-aws-credentials@v4
       with:
         aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        aws-region: ${{ env.AWS_REGION }}
+        aws-region: 'us-east-1'
     
-    - name: Deploy to EC2
+    - name: Execute Full Deployment
       env:
         INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID }}
         MAIN_SHA: ${{ steps.sha.outputs.sha }}
       run: |
-        echo "🚀 Deploying to EC2..."
-        
-        # Create timestamp for new release
         TIMESTAMP=$(date +%Y%m%d%H%M%S)
-        RELEASE_NAME="myapp-release-$TIMESTAMP"
+        RELEASE_DIR="myapp-release-$TIMESTAMP"
         
-        # Send simple, reliable commands
+        echo "🚀 Starting deployment: $RELEASE_DIR"
+        echo "Image tag: $MAIN_SHA"
+        
+        # Prepare deployment script
+        cat > /tmp/deploy_all.sh << 'DEPLOY_ALL'
+        #!/bin/bash
+        set -e
+
+        TIMESTAMP="$1"
+        MAIN_SHA="$2"
+        RELEASE_DIR="myapp-release-$TIMESTAMP"
+
+        echo "=== FULL DEPLOYMENT STARTED ==="
+        echo "Release: $RELEASE_DIR"
+        echo "Image tag: $MAIN_SHA"
+        echo "Timestamp: $(date)"
+        echo ""
+
+        # 1. Create release directory
+        echo "📁 Creating release directory..."
+        mkdir -p /home/ubuntu/releases/$RELEASE_DIR/nginx
+        cd /home/ubuntu/releases/$RELEASE_DIR
+
+        # 2. Copy docker-compose.yml and nginx config from main branch code
+        echo "📦 Copying application code..."
+        if [ -f "/tmp/app-code/docker-compose.yml" ]; then
+          cp /tmp/app-code/docker-compose.yml .
+          echo "✅ Copied docker-compose.yml"
+        else
+          echo "❌ docker-compose.yml not found in /tmp/app-code/"
+          exit 1
+        fi
+
+        if [ -f "/tmp/app-code/nginx/nginx.conf" ]; then
+          cp /tmp/app-code/nginx/nginx.conf ./nginx/
+          echo "✅ Copied nginx.conf"
+        fi
+
+        # 3. Update image tags in docker-compose.yml
+        echo "🏷️ Updating image tags..."
+        sed -i "s|aarchtou/youraws-backend:latest|aarchtou/youraws-backend:$MAIN_SHA|g" docker-compose.yml
+        sed -i "s|aarchtou/youraws-frontend:latest|aarchtou/youraws-frontend:$MAIN_SHA|g" docker-compose.yml
+        echo "Updated to: aarchtou/youraws-backend:$MAIN_SHA"
+        echo "Updated to: aarchtou/youraws-frontend:$MAIN_SHA"
+
+        # 4. Copy deployment scripts from release branch
+        echo "📜 Setting up deployment scripts..."
+        mkdir -p /home/ubuntu/deploy
+        if [ -d "/tmp/release-scripts/deploy" ]; then
+          cp -r /tmp/release-scripts/deploy/* /home/ubuntu/deploy/
+          chmod +x /home/ubuntu/deploy/*.sh 2>/dev/null || true
+          echo "✅ Copied deployment scripts"
+        else
+          echo "⚠️ No deploy directory in release branch"
+        fi
+
+        # 5. Check if deploy.sh exists, create basic one if not
+        if [ ! -f "/home/ubuntu/deploy/deploy.sh" ]; then
+          echo "⚠️ deploy.sh not found, creating basic script..."
+          cat > /home/ubuntu/deploy/deploy.sh << 'BASIC_DEPLOY'
+        #!/bin/bash
+        set -e
+        echo "🚀 Deploying: $1"
+        cd "$1"
+        docker-compose down 2>/dev/null || true
+        docker-compose up -d
+        echo "✅ Deployment started"
+        BASIC_DEPLOY
+          chmod +x /home/ubuntu/deploy/deploy.sh
+        fi
+
+        # 6. Execute the deployment
+        echo "⚡ Executing deployment script..."
+        cd /home/ubuntu
+        if [ -f "deploy/deploy.sh" ]; then
+          chmod +x deploy/deploy.sh
+          ./deploy/deploy.sh /home/ubuntu/releases/$RELEASE_DIR
+        else
+          echo "❌ deploy.sh still not found!"
+          exit 1
+        fi
+
+        # 7. Wait and verify
+        echo "⏳ Waiting for containers to start..."
+        sleep 15
+
+        echo "=== DEPLOYMENT STATUS ==="
+        docker ps
+        echo ""
+
+        echo "=== APPLICATION HEALTH ==="
+        if curl -s http://localhost/health > /dev/null; then
+          echo "✅ Health check passed"
+        else
+          echo "⚠️ Health check failed"
+        fi
+
+        echo ""
+        echo "=== DEPLOYMENT COMPLETE ==="
+        echo "Release: /home/ubuntu/releases/$RELEASE_DIR"
+        echo "Image tag: $MAIN_SHA"
+        echo "Time: $(date)"
+        DEPLOY_ALL
+
+        # Make the script executable
+        chmod +x /tmp/deploy_all.sh
+        
+        # Prepare files for transfer to EC2
+        echo "📤 Preparing files for EC2..."
+        
+        # 1. Create tar of app code (main branch)
+        tar -czf /tmp/app-code.tar.gz -C ./app-code .
+        
+        # 2. Create tar of deployment scripts (release branch)
+        if [ -d "release-scripts/deploy" ]; then
+          tar -czf /tmp/deploy-scripts.tar.gz -C ./release-scripts/deploy .
+        else
+          # Create empty tar if no deploy directory
+          tar -czf /tmp/deploy-scripts.tar.gz -T /dev/null
+        fi
+        
+        # 3. Upload files to EC2 and execute deployment
+        echo "🚀 Sending files and executing deployment on EC2..."
+        
+        # We'll use a multi-step SSM command to avoid escaping issues
         aws ssm send-command \
           --instance-ids $INSTANCE_ID \
           --document-name "AWS-RunShellScript" \
           --parameters '{
             "commands": [
-              "cd /home/ubuntu",
-              "mkdir -p releases",
-              "mkdir -p releases/'$RELEASE_NAME'/nginx",
-              "cd releases/'$RELEASE_NAME'",
-              "curl -s https://raw.githubusercontent.com/abdellah-archtou/UrawsAssessment/main/docker-compose.yml -o docker-compose.yml",
-              "curl -s https://raw.githubusercontent.com/abdellah-archtou/UrawsAssessment/main/nginx/nginx.conf -o nginx/nginx.conf 2>/dev/null || true",
-              "sed -i \"s|aarchtou/youraws-backend:latest|aarchtou/youraws-backend:'$MAIN_SHA'|g\" docker-compose.yml",
-              "sed -i \"s|aarchtou/youraws-frontend:latest|aarchtou/youraws-frontend:'$MAIN_SHA'|g\" docker-compose.yml",
-              "docker-compose pull || echo \"Pull failed, continuing\"",
-              "if [ -f \"/home/ubuntu/deploy/deploy.sh\" ]; then",
-              "  cd /home/ubuntu",
-              "  chmod +x deploy/deploy.sh",
-              "  ./deploy/deploy.sh /home/ubuntu/releases/'$RELEASE_NAME'",
-              "else",
-              "  cd /home/ubuntu/releases/'$RELEASE_NAME'",
-              "  docker-compose up -d",
-              "fi",
-              "sleep 10",
-              "docker-compose ps",
-              "curl -s http://localhost/health && echo \"Health OK\" || echo \"Health check failed\"",
-              "echo \"Deployed: '$RELEASE_NAME' with images tagged: '$MAIN_SHA'\""
+              "cd /tmp",
+              "echo === Step 1: Clean up old temp files ===",
+              "rm -rf /tmp/app-code /tmp/release-scripts 2>/dev/null || true",
+              "mkdir -p /tmp/app-code /tmp/release-scripts",
+              "echo === Step 2: Ready for file transfer ==="
             ]
           }'
         
-        echo "✅ Deployment command sent"
-        echo "New release: $RELEASE_NAME"
+        # Give it a moment
+        sleep 2
+        
+        # Now we need to transfer files. Since SSM doesn't support direct file transfer,
+        # we'll use base64 encoding to send files
+        echo "📦 Encoding and transferring files..."
+        
+        # Encode files as base64
+        APP_CODE_B64=$(base64 -w 0 /tmp/app-code.tar.gz)
+        DEPLOY_SCRIPTS_B64=$(base64 -w 0 /tmp/deploy-scripts.tar.gz)
+        
+        # Create the full deployment command
+        cat > /tmp/full_deployment_command.sh << 'FINAL_COMMAND'
+        #!/bin/bash
+        set -e
+
+        TIMESTAMP="$1"
+        MAIN_SHA="$2"
+        APP_CODE_B64="$3"
+        DEPLOY_SCRIPTS_B64="$4"
+        RELEASE_DIR="myapp-release-$TIMESTAMP"
+
+        echo "=== RECEIVING AND EXTRACTING FILES ==="
+
+        # Decode and extract app code
+        echo "📦 Extracting application code..."
+        echo "$APP_CODE_B64" | base64 -d > /tmp/app-code.tar.gz
+        tar -xzf /tmp/app-code.tar.gz -C /tmp/app-code
+        ls -la /tmp/app-code/
+
+        # Decode and extract deploy scripts if not empty
+        echo "📦 Extracting deployment scripts..."
+        if [ -n "$DEPLOY_SCRIPTS_B64" ] && [ "$DEPLOY_SCRIPTS_B64" != "H4sIAAAAAAAA/wMAAAAAAAAAAAA=" ]; then  # Check if not empty tar
+          echo "$DEPLOY_SCRIPTS_B64" | base64 -d > /tmp/deploy-scripts.tar.gz
+          tar -xzf /tmp/deploy-scripts.tar.gz -C /tmp/release-scripts
+          ls -la /tmp/release-scripts/
+        else
+          echo "⚠️ No deployment scripts provided"
+        fi
+
+        # Now execute the deployment
+        echo ""
+        echo "=== EXECUTING DEPLOYMENT ==="
+
+        # Create release directory
+        mkdir -p /home/ubuntu/releases/$RELEASE_DIR/nginx
+        cd /home/ubuntu/releases/$RELEASE_DIR
+
+        # Copy docker-compose.yml
+        if [ -f "/tmp/app-code/docker-compose.yml" ]; then
+          cp /tmp/app-code/docker-compose.yml .
+          echo "✅ Copied docker-compose.yml"
+        else
+          echo "❌ docker-compose.yml not found"
+          exit 1
+        fi
+
+        # Copy nginx config if exists
+        if [ -f "/tmp/app-code/nginx/nginx.conf" ]; then
+          cp /tmp/app-code/nginx/nginx.conf ./nginx/
+          echo "✅ Copied nginx.conf"
+        fi
+
+        # Update image tags
+        sed -i "s|aarchtou/youraws-backend:latest|aarchtou/youraws-backend:$MAIN_SHA|g" docker-compose.yml
+        sed -i "s|aarchtou/youraws-frontend:latest|aarchtou/youraws-frontend:$MAIN_SHA|g" docker-compose.yml
+
+        # Copy deployment scripts
+        mkdir -p /home/ubuntu/deploy
+        if [ -d "/tmp/release-scripts" ]; then
+          cp -r /tmp/release-scripts/* /home/ubuntu/deploy/ 2>/dev/null || true
+          chmod +x /home/ubuntu/deploy/*.sh 2>/dev/null || true
+        fi
+
+        # Ensure deploy.sh exists
+        if [ ! -f "/home/ubuntu/deploy/deploy.sh" ]; then
+          cat > /home/ubuntu/deploy/deploy.sh << 'EOF'
+        #!/bin/bash
+        set -e
+        echo "🚀 Deploying: $1"
+        cd "$1"
+        docker-compose down 2>/dev/null || true
+        docker-compose up -d
+        echo "✅ Deployment started"
+        EOF
+          chmod +x /home/ubuntu/deploy/deploy.sh
+        fi
+
+        # Execute deployment
+        cd /home/ubuntu
+        ./deploy/deploy.sh /home/ubuntu/releases/$RELEASE_DIR
+
+        # Verify
+        sleep 10
+        echo ""
+        echo "=== VERIFICATION ==="
+        docker ps
+        echo ""
+        curl -s http://localhost/health && echo "✅ Health check passed" || echo "⚠️ Health check failed"
+
+        echo ""
+        echo "🎉 DEPLOYMENT COMPLETE!"
+        echo "Release: /home/ubuntu/releases/$RELEASE_DIR"
         echo "Image tag: $MAIN_SHA"
+        echo "Time: $(date)"
+        FINAL_COMMAND
+
+        # Make final command executable
+        chmod +x /tmp/full_deployment_command.sh
+        
+        # Send the final command
+        aws ssm send-command \
+          --instance-ids $INSTANCE_ID \
+          --document-name "AWS-RunShellScript" \
+          --parameters 'commands=[
+            "cd /tmp",
+            "cat > deploy.sh << \"DEPLOY_EOF\"",
+            "'"$(cat /tmp/full_deployment_command.sh | sed 's/"/\\"/g')"'",
+            "DEPLOY_EOF",
+            "chmod +x deploy.sh",
+            "./deploy.sh \"'$TIMESTAMP'\" \"'$MAIN_SHA'\" \"'$APP_CODE_B64'\" \"'$DEPLOY_SCRIPTS_B64'\""
+          ]'
+        
+        echo "✅ Full deployment command sent to EC2"
     
-    - name: Manual Verification
+    - name: Wait and Verify
       run: |
+        echo "⏳ Waiting 60 seconds for deployment to complete..."
+        sleep 60
         echo ""
-        echo "🔍 MANUAL VERIFICATION REQUIRED"
+        echo "📋 MANUAL VERIFICATION CHECKLIST:"
         echo "================================"
-        echo ""
-        echo "Since the pipeline only sends commands, you must verify:"
-        echo ""
-        echo "1. SSH to your EC2:"
-        echo "   ssh -i your-key.pem ubuntu@YOUR_EC2_IP"
-        echo ""
-        echo "2. Check the new release:"
-        echo "   cd /home/ubuntu/releases"
-        echo "   ls -la"
-        echo ""
-        echo "3. Check the active release:"
-        echo "   ls -la /home/ubuntu/myapp"
-        echo "   readlink -f /home/ubuntu/myapp"
-        echo ""
-        echo "4. Check containers:"
-        echo "   cd /home/ubuntu/myapp"
-        echo "   docker-compose ps"
-        echo "   docker-compose logs"
-        echo ""
-        echo "5. Test the app:"
-        echo "   curl http://localhost/health"
-        echo "   curl http://localhost"
+        echo "1. SSH to EC2: ssh -i key.pem ubuntu@EC2_IP"
+        echo "2. Check new release: ls -la /home/ubuntu/releases/"
+        echo "3. Check docker-compose.yml: cat /home/ubuntu/releases/myapp-release-*/docker-compose.yml | grep image:"
+        echo "4. Check deployment scripts: ls -la /home/ubuntu/deploy/"
+        echo "5. Check containers: docker ps"
+        echo "6. Test app: curl http://localhost/health"
