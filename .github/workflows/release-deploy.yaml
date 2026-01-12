@@ -1,0 +1,100 @@
+name: Simple Deployment Pipeline
+on:
+  push:
+    branches: [release]
+    paths: [deploy-trigger.txt]
+
+env:
+  DOCKERHUB_USERNAME: 'aarchtou'
+  AWS_REGION: 'us-east-1'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Get Main Branch SHA
+      id: sha
+      run: |
+        SHA=$(git ls-remote https://github.com/${{ github.repository }} refs/heads/main | cut -f1 | head -c 8)
+        echo "sha=$SHA" >> $GITHUB_OUTPUT
+        echo "✅ Main SHA: $SHA"
+    
+    - name: Configure AWS
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+    
+    - name: Deploy to EC2
+      env:
+        INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID }}
+        MAIN_SHA: ${{ steps.sha.outputs.sha }}
+      run: |
+        echo "🚀 Deploying to EC2..."
+        
+        # Create timestamp for new release
+        TIMESTAMP=$(date +%Y%m%d%H%M%S)
+        RELEASE_NAME="myapp-release-$TIMESTAMP"
+        
+        # Send simple, reliable commands
+        aws ssm send-command \
+          --instance-ids $INSTANCE_ID \
+          --document-name "AWS-RunShellScript" \
+          --parameters '{
+            "commands": [
+              "cd /home/ubuntu",
+              "mkdir -p releases",
+              "mkdir -p releases/'$RELEASE_NAME'/nginx",
+              "cd releases/'$RELEASE_NAME'",
+              "curl -s https://raw.githubusercontent.com/abdellah-archtou/UrawsAssessment/main/docker-compose.yml -o docker-compose.yml",
+              "curl -s https://raw.githubusercontent.com/abdellah-archtou/UrawsAssessment/main/nginx/nginx.conf -o nginx/nginx.conf 2>/dev/null || true",
+              "sed -i \"s|aarchtou/youraws-backend:latest|aarchtou/youraws-backend:'$MAIN_SHA'|g\" docker-compose.yml",
+              "sed -i \"s|aarchtou/youraws-frontend:latest|aarchtou/youraws-frontend:'$MAIN_SHA'|g\" docker-compose.yml",
+              "docker-compose pull || echo \"Pull failed, continuing\"",
+              "if [ -f \"/home/ubuntu/deploy/deploy.sh\" ]; then",
+              "  cd /home/ubuntu",
+              "  chmod +x deploy/deploy.sh",
+              "  ./deploy/deploy.sh /home/ubuntu/releases/'$RELEASE_NAME'",
+              "else",
+              "  cd /home/ubuntu/releases/'$RELEASE_NAME'",
+              "  docker-compose up -d",
+              "fi",
+              "sleep 10",
+              "docker-compose ps",
+              "curl -s http://localhost/health && echo \"Health OK\" || echo \"Health check failed\"",
+              "echo \"Deployed: '$RELEASE_NAME' with images tagged: '$MAIN_SHA'\""
+            ]
+          }'
+        
+        echo "✅ Deployment command sent"
+        echo "New release: $RELEASE_NAME"
+        echo "Image tag: $MAIN_SHA"
+    
+    - name: Manual Verification
+      run: |
+        echo ""
+        echo "🔍 MANUAL VERIFICATION REQUIRED"
+        echo "================================"
+        echo ""
+        echo "Since the pipeline only sends commands, you must verify:"
+        echo ""
+        echo "1. SSH to your EC2:"
+        echo "   ssh -i your-key.pem ubuntu@YOUR_EC2_IP"
+        echo ""
+        echo "2. Check the new release:"
+        echo "   cd /home/ubuntu/releases"
+        echo "   ls -la"
+        echo ""
+        echo "3. Check the active release:"
+        echo "   ls -la /home/ubuntu/myapp"
+        echo "   readlink -f /home/ubuntu/myapp"
+        echo ""
+        echo "4. Check containers:"
+        echo "   cd /home/ubuntu/myapp"
+        echo "   docker-compose ps"
+        echo "   docker-compose logs"
+        echo ""
+        echo "5. Test the app:"
+        echo "   curl http://localhost/health"
+        echo "   curl http://localhost"
