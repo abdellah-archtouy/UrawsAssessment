@@ -5,7 +5,7 @@ on:
       - release
     paths:
       - 'deploy-trigger.txt'
-      - 'docker-compose.yml'
+      - 'docker compose.yml'
       - 'backend/**'
       - 'frontend/**'
       - 'nginx/**'
@@ -32,9 +32,9 @@ jobs:
       run: |
         echo "🔍 Validating infrastructure..."
         
-        # Test that docker-compose is valid
-        docker-compose config --quiet || {
-          echo "❌ Invalid docker-compose.yml"
+        # Test that docker compose is valid
+        docker compose config --quiet || {
+          echo "❌ Invalid docker compose.yml"
           exit 1
         }
         
@@ -150,11 +150,11 @@ jobs:
         
         cd $APP_DIR || { echo "❌ Directory $APP_DIR not found"; exit 1; }
         
-        if [ -f "docker-compose.yml" ]; then
-          cp docker-compose.yml "docker-compose.backup.$(date +%Y%m%d-%H%M%S).yml"
+        if [ -f "docker compose.yml" ]; then
+          cp docker compose.yml "docker compose.backup.$(date +%Y%m%d-%H%M%S).yml"
         fi
         
-        cat > docker-compose.yml << 'DCEOF'
+        cat > docker compose.yml << 'DCEOF'
         version: '3.8'
         
         services:
@@ -214,23 +214,23 @@ jobs:
             driver: local
         DCEOF
         
-        echo "📄 Created docker-compose.yml with image tag: ${DEPLOYMENT_ID}"
+        echo "📄 Created docker compose.yml with image tag: ${DEPLOYMENT_ID}"
         
         echo "⬇️ Pulling Docker images..."
-        docker-compose pull
+        docker compose pull
         
         echo "🛑 Stopping old containers..."
-        docker-compose down
+        docker compose down
         
         echo "▶️ Starting new containers..."
-        docker-compose up -d
+        docker compose up -d
         
         echo "🧹 Cleaning up old images..."
         docker image prune -af --filter "until=24h"
         
         echo "✅ Deployment completed successfully!"
         echo "🔍 Checking container status..."
-        docker-compose ps
+        docker compose ps
         
         echo "🏥 Running health checks..."
         sleep 10
@@ -371,7 +371,7 @@ jobs:
               --document-name "AWS-RunShellScript" \
               --parameters 'commands=[
                 "cd /opt/uraws",
-                "docker-compose ps | grep -c \"Up\""
+                "docker compose ps | grep -c \"Up\""
               ]' \
               --output text
           fi
@@ -461,16 +461,16 @@ jobs:
             --parameters 'commands=[
               "cd /opt/uraws",
               "echo \"Looking for backup files...\"",
-              "BACKUP_FILE=$(ls -t docker-compose.backup.*.yml 2>/dev/null | head -1)",
+              "BACKUP_FILE=$(ls -t docker compose.backup.*.yml 2>/dev/null | head -1)",
               "if [ -n \"$BACKUP_FILE\" ]; then",
               "  echo \"Found backup: $BACKUP_FILE\"",
-              "  cp \"$BACKUP_FILE\" docker-compose.yml",
-              "  docker-compose down",
-              "  docker-compose up -d",
+              "  cp \"$BACKUP_FILE\" docker compose.yml",
+              "  docker compose down",
+              "  docker compose up -d",
               "  echo \"Rollback completed\"",
               "else",
               "  echo \"No backup found. Checking current status...\"",
-              "  docker-compose ps",
+              "  docker compose ps",
               "fi"
             ]' \
             --output text

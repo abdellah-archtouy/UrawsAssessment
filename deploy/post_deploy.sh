@@ -31,7 +31,7 @@ for SERVICE in $SERVICES; do
       
     frontend)
       # Frontend doesn't have a health endpoint, check if container is running
-      if docker-compose ps frontend | grep -q "Up"; then
+      if docker compose ps frontend | grep -q "Up"; then
         echo "     ✅ Frontend container is running"
       else
         echo "     ❌ Frontend container is not running"
@@ -40,7 +40,7 @@ for SERVICE in $SERVICES; do
       ;;
       
     mysql)
-      if docker-compose exec mysql mysqladmin ping -h localhost --silent; then
+      if docker compose exec mysql mysqladmin ping -h localhost --silent; then
         echo "     ✅ MySQL is responsive"
       else
         echo "     ❌ MySQL is not responsive"
@@ -49,7 +49,7 @@ for SERVICE in $SERVICES; do
       ;;
       
     nginx)
-      if docker-compose exec nginx nginx -t > /dev/null 2>&1; then
+      if docker compose exec nginx nginx -t > /dev/null 2>&1; then
         echo "     ✅ Nginx configuration is valid"
       else
         echo "     ❌ Nginx configuration is invalid"
@@ -104,7 +104,7 @@ echo "4. Deployment summary:"
 
 # Get image versions
 echo "   Deployed image versions:"
-docker-compose images | tail -n +2 | while read line; do
+docker compose images | tail -n +2 | while read line; do
   SERVICE=$(echo $line | awk '{print $1}')
   IMAGE=$(echo $line | awk '{print $2}')
   echo "     $SERVICE: $IMAGE"
@@ -123,6 +123,6 @@ else
   echo "Some checks failed. Please investigate."
   echo ""
   echo "Debug information:"
-  docker-compose logs --tail=20
+  docker compose logs --tail=20
   exit 1
 fi
