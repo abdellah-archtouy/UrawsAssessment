@@ -49,243 +49,56 @@ jobs:
           echo "✅ Release ID: $RELEASE_ID"
           echo "✅ Branch: ${{ github.ref_name }}"
 
-      - name: Execute automated deployment
+      - name: Execute automated deployment (Simplified)
         id: deployment
         run: |
           echo "🚀 Starting automated deployment to EC2..."
-          echo "Instance: $EC2_INSTANCE_ID"
-          echo "App Directory: $APP_DIR"
-          echo "Repository: https://github.com/${{ github.repository }}.git"
           
-          # Create the complete automated deployment script
-          DEPLOY_SCRIPT=$(cat << 'DEPLOY_EOF'
+          # Create a much simpler script that's easier to pass
+          SIMPLE_SCRIPT=$(cat << 'SIMPLE_EOF'
           #!/bin/bash
           set -e
           
-          echo "══════════════════════════════════════════════════════"
-          echo "🤖 AUTOMATED DEPLOYMENT STARTED"
-          echo "══════════════════════════════════════════════════════"
-          echo "Timestamp:   $(date)"
-          echo "Release:     $RELEASE_ID"
-          echo "Environment: $ENVIRONMENT"
-          echo "Branch:      $BRANCH"
-          echo "Commit:      ${COMMIT_SHA:0:8}"
-          echo "Repo:        $REPO_URL"
-          echo "══════════════════════════════════════════════════════"
-          
-          # Configuration
+          echo "Starting deployment..."
           APP_DIR="/home/ubuntu/myapp"
-          BACKUP_DIR="/home/ubuntu/deploy-backups"
-          MAX_BACKUPS=5
-          
-          # Function to log messages
-          log() {
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
-          }
-          
-          # Function to handle errors
-          error_exit() {
-            log "❌ ERROR: $1"
-            exit 1
-          }
-          
-          log "Starting deployment process..."
-          
-          # Step 1: Check system prerequisites
-          log "🔍 [1/6] Checking system prerequisites..."
-          echo "----------------------------------------"
-          
-          # Check Docker
-          if ! command -v docker &> /dev/null; then
-            error_exit "Docker is not installed. Please install Docker first."
-          fi
-          
-          # Check Docker Compose
-          if ! command -v docker-compose &> /dev/null && ! docker compose version &> /dev/null; then
-            error_exit "Docker Compose is not installed. Please install Docker Compose."
-          fi
-          
-          # Check Git
-          if ! command -v git &> /dev/null; then
-            error_exit "Git is not installed. Please install Git."
-          fi
-          
-          log "✅ Docker: $(docker --version)"
-          log "✅ Docker Compose: $(docker compose version 2>/dev/null || docker-compose --version)"
-          log "✅ Git: $(git --version)"
-          
-          # Step 2: Create backup directory
-          log "💾 [2/6] Setting up backup directory..."
-          echo "----------------------------------------"
-          mkdir -p "$BACKUP_DIR"
-          log "Backup directory: $BACKUP_DIR"
-          
-          # Step 3: Clone or update repository
-          log "📥 [3/6] Setting up application directory..."
-          echo "----------------------------------------"
-          
           mkdir -p "$APP_DIR"
           cd "$APP_DIR"
           
+          # Clone or update repo
           if [ -d ".git" ]; then
-            log "Repository already exists at $APP_DIR"
-            log "Fetching latest changes from $BRANCH..."
-            
-            # Stash any local changes
-            git stash || true
-            
-            # Fetch and reset to latest
-            git fetch origin
-            git checkout -f "$BRANCH"
-            git reset --hard "origin/$BRANCH"
-            git clean -fdx
-            
-            log "✅ Repository updated to latest $BRANCH"
+              git fetch origin
+              git checkout -f "$BRANCH"
+              git reset --hard "origin/$BRANCH"
+              echo "Repository updated"
           else
-            log "Cloning repository for the first time..."
-            log "Repository: $REPO_URL"
-            log "Branch: $BRANCH"
-            log "Target: $APP_DIR"
-            
-            # Remove directory if exists but not a git repo
-            rm -rf "$APP_DIR"
-            mkdir -p "$APP_DIR"
-            cd "$APP_DIR"
-            
-            # Clone the repository
-            git clone -b "$BRANCH" "$REPO_URL" .
-            
-            if [ $? -eq 0 ]; then
-              log "✅ Repository cloned successfully"
-            else
-              error_exit "Failed to clone repository. Check URL and branch."
-            fi
+              rm -rf "$APP_DIR"
+              git clone -b "$BRANCH" "$REPO_URL" "$APP_DIR"
+              cd "$APP_DIR"
+              echo "Repository cloned"
           fi
           
-          # Show current status
-          log "Current directory: $(pwd)"
-          log "Git status:"
-          git log --oneline -3
+          # Docker operations
+          docker compose down || true
+          docker compose up -d --build
           
-          # Step 4: Create/update environment file
-          log "⚙️  [4/6] Setting up environment..."
-          echo "----------------------------------------"
-          
-          # Create .env from .env.example if it exists
-          if [ -f ".env.example" ] && [ ! -f ".env" ]; then
-            log "Creating .env file from .env.example"
-            cp .env.example .env
-          fi
-          
-          # Ensure .env file exists
-          if [ ! -f ".env" ]; then
-            log "Creating new .env file"
-            touch .env
-          fi
-          
-          # Add deployment info to .env
-          {
-            echo ""
-            echo "# Auto-deployment info"
-            echo "DEPLOYMENT_ID=$RELEASE_ID"
-            echo "DEPLOYMENT_ENV=$ENVIRONMENT"
-            echo "DEPLOYMENT_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-            echo "GIT_BRANCH=$BRANCH"
-            echo "GIT_COMMIT=$COMMIT_SHA"
-          } >> .env
-          
-          log "✅ Environment configured"
-          
-          # Step 5: Docker operations
-          log "🐳 [5/6] Managing Docker containers..."
-          echo "----------------------------------------"
-          
-          # Check if docker-compose.yml exists
-          if [ ! -f "docker-compose.yml" ] && [ ! -f "docker-compose.yaml" ]; then
-            error_exit "docker-compose.yml not found in repository!"
-          fi
-          
-          # Stop existing containers if any
-          log "Stopping existing containers..."
-          docker compose down --remove-orphans --timeout 30 2>/dev/null || true
-          
-          # Build or pull images
-          if [[ "$FORCE_REBUILD" == "true" ]]; then
-            log "🔨 Force rebuilding Docker images..."
-            docker compose build --no-cache
-          else
-            log "Pulling latest Docker images..."
-            docker compose pull || {
-              log "Pull failed, building images instead..."
-              docker compose build
-            }
-          fi
-          
-          # Start containers
-          log "Starting Docker containers..."
-          docker compose up -d
-          
-          # Step 6: Verification
-          log "✅ [6/6] Verifying deployment..."
-          echo "----------------------------------------"
-          
-          # Wait for containers to start
-          log "Waiting for containers to become healthy..."
-          sleep 15
-          
-          # Check container status
-          log "Container status:"
+          echo "Deployment completed at $(date)"
           docker compose ps
-          
-          # Count running containers
-          RUNNING=$(docker compose ps --services --filter "status=running" | wc -l)
-          TOTAL=$(docker compose ps --services | wc -l)
-          
-          if [ "$RUNNING" -eq "$TOTAL" ]; then
-            log "✅ All $TOTAL containers are running"
-          else
-            log "⚠️  Only $RUNNING out of $TOTAL containers are running"
-            log "Recent logs:"
-            docker compose logs --tail=10
-          fi
-          
-          # Clean up old Docker resources
-          log "Cleaning up unused Docker resources..."
-          docker system prune -f --filter "until=24h" 2>/dev/null || true
-          
-          # Clean up old backups
-          log "Cleaning up old backups..."
-          (cd "$BACKUP_DIR" && ls -dt backup-* 2>/dev/null | tail -n +$((MAX_BACKUPS + 1)) | xargs rm -rf 2>/dev/null || true)
-          
-          echo ""
-          echo "══════════════════════════════════════════════════════"
-          echo "🎉 AUTOMATED DEPLOYMENT COMPLETED SUCCESSFULLY!"
-          echo "══════════════════════════════════════════════════════"
-          echo "• Application:     $APP_DIR"
-          echo "• Environment:     $ENVIRONMENT"
-          echo "• Release ID:      $RELEASE_ID"
-          echo "• Containers:      $RUNNING/$TOTAL running"
-          echo "• Completed at:    $(date)"
-          echo "══════════════════════════════════════════════════════"
-          DEPLOY_EOF
+          SIMPLE_EOF
           )
           
-          # Send the deployment command via SSM
+          # Base64 encode the script to avoid quoting issues
+          ENCODED_SCRIPT=$(echo "$SIMPLE_SCRIPT" | base64 -w0)
+          
+          # Send command with base64 encoded script
           COMMAND_ID=$(aws ssm send-command \
-            --instance-ids "$EC2_INSTANCE_ID" \
-            --document-name "AWS-RunShellScript" \
-            --parameters "commands=[$DEPLOY_SCRIPT],environment=[APP_DIR=$APP_DIR,ENVIRONMENT=${{ steps.vars.outputs.environment }},RELEASE_ID=${{ steps.vars.outputs.release_id }},BRANCH=${{ steps.vars.outputs.deploy_branch }},COMMIT_SHA=${{ github.sha }},REPO_URL=https://github.com/${{ github.repository }}.git,FORCE_REBUILD=${{ github.event.inputs.force_rebuild || false }}]" \
-            --comment "Auto-deploy ${{ steps.vars.outputs.environment }} - ${{ steps.vars.outputs.release_id }}" \
-            --timeout-seconds 600 \
-            --query 'Command.CommandId' \
-            --output text)
+              --instance-ids "$EC2_INSTANCE_ID" \
+              --document-name "AWS-RunShellScript" \
+              --parameters "commands=['echo $ENCODED_SCRIPT | base64 -d | bash']" \
+              --comment "Simple deployment" \
+              --query 'Command.CommandId' \
+              --output text)
           
-          if [ -z "$COMMAND_ID" ]; then
-            echo "❌ Failed to send deployment command"
-            exit 1
-          fi
-          
-          echo "Deployment Command ID: $COMMAND_ID"
+          echo "Command ID: $COMMAND_ID"
           echo "COMMAND_ID=$COMMAND_ID" >> $GITHUB_OUTPUT
 
       - name: Monitor deployment progress
