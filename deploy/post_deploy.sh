@@ -12,7 +12,7 @@ cd /opt/uraws
 echo "1. Checking all containers are running..."
 ALL_RUNNING=true
 for service in mysql backend frontend nginx; do
-  if docker-compose ps $service | grep -q "Up"; then
+  if docker compose ps $service | grep -q "Up"; then
     echo "✅ $service is running"
   else
     echo "❌ $service is NOT running"
@@ -55,7 +55,7 @@ if [ "$ALL_RUNNING" = true ]; then
   echo "Deployed tag: $1"
 else
   echo "⚠️ Some services may have issues."
-  echo "Check logs with: docker-compose logs"
+  echo "Check logs with: docker compose logs"
   exit 1
 fi
 

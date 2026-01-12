@@ -11,7 +11,7 @@ cd /opt/uraws || { echo "Creating /opt/uraws directory"; mkdir -p /opt/uraws; cd
 
 echo "1. Checking Docker installation..."
 docker --version || { echo "❌ Docker not installed"; exit 1; }
-docker-compose --version || { echo "❌ Docker Compose not installed"; exit 1; }
+docker compose --version || { echo "❌ Docker Compose not installed"; exit 1; }
 
 echo "2. Checking disk space..."
 df -h / | tail -1

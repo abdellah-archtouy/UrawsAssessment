@@ -14,17 +14,17 @@ sed -i "s|aarchtou/youraws-backend:latest|aarchtou/youraws-backend:$1|g" docker-
 sed -i "s|aarchtou/youraws-frontend:latest|aarchtou/youraws-frontend:$1|g" docker-compose.yml
 
 echo "2. Pulling new images from Docker Hub..."
-docker-compose pull || {
+docker compose pull || {
   echo "❌ Failed to pull images"
   echo "Trying to build locally..."
   exit 1
 }
 
 echo "3. Stopping existing containers..."
-docker-compose down || true
+docker compose down || true
 
 echo "4. Starting new containers..."
-docker-compose up -d || {
+docker compose up -d || {
   echo "❌ Failed to start containers"
   exit 1
 }
@@ -33,7 +33,7 @@ echo "5. Waiting for services to start..."
 sleep 20
 
 echo "6. Checking container status..."
-docker-compose ps
+docker compose ps
 
 echo "7. Cleaning up old images..."
 docker image prune -af 2>/dev/null || true

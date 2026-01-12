@@ -1,298 +1,41 @@
-name: Release Branch Deployment Pipeline
+name: Simple Deployment Pipeline
 on:
   push:
-    branches:
-      - release
-    paths:
-      - 'deploy-trigger.txt'
-
-env:
-  DOCKERHUB_USERNAME: 'aarchtou'
-  AWS_REGION: 'us-east-1'
+    branches: [release]
+    paths: [deploy-trigger.txt]
 
 jobs:
-  # JOB 1: Get Main Branch Info & Safety Check
-  prepare:
-    runs-on: ubuntu-latest
-    outputs:
-      main_sha: ${{ steps.get-sha.outputs.sha }}
-      safe_to_deploy: ${{ steps.safety-check.outputs.safe }}
-    
-    steps:
-    - name: Checkout Release Branch
-      uses: actions/checkout@v4
-      with:
-        ref: release
-    
-    - name: Get Main Branch Commit SHA
-      id: get-sha
-      run: |
-        echo "📦 Getting latest main branch commit..."
-        MAIN_SHA=$(git ls-remote https://github.com/${{ github.repository }} refs/heads/main | cut -f1)
-        SHORT_SHA=${MAIN_SHA:0:8}
-        echo "sha=$SHORT_SHA" >> $GITHUB_OUTPUT
-        echo "✅ Main branch SHA: $SHORT_SHA"
-    
-    - name: Check Safety Lock
-      id: safety-check
-      run: |
-        if [ "${{ secrets.SAFETY_LOCK_ENABLED || 'true' }}" = "true" ]; then
-          echo "🔒 SAFETY LOCK ENABLED - Deployment blocked"
-          echo "::warning::To deploy, set SAFETY_LOCK_ENABLED=false in GitHub Secrets"
-          echo "safe=false" >> $GITHUB_OUTPUT
-        else
-          echo "✅ Safety lock disabled - Ready for deployment"
-          echo "safe=true" >> $GITHUB_OUTPUT
-        fi
-
-  # JOB 2: Build Docker Images
-  build:
-    runs-on: ubuntu-latest
-    needs: prepare
-    if: needs.prepare.outputs.safe_to_deploy == 'true'
-    
-    steps:
-    - name: Checkout Main Branch
-      uses: actions/checkout@v4
-      with:
-        ref: main
-    
-    - name: Build Backend Image
-      run: |
-        echo "🔨 Building backend image..."
-        cd backend
-        docker build -t ${{ env.DOCKERHUB_USERNAME }}/youraws-backend:${{ needs.prepare.outputs.main_sha }} .
-        echo "✅ Backend image built"
-    
-    - name: Build Frontend Image
-      run: |
-        echo "🔨 Building frontend image..."
-        cd frontend
-        docker build -t ${{ env.DOCKERHUB_USERNAME }}/youraws-frontend:${{ needs.prepare.outputs.main_sha }} .
-        echo "✅ Frontend image built"
-    
-    - name: Push to Docker Hub (Optional)
-      if: ${{ secrets.DOCKERHUB_TOKEN != '' }}
-      run: |
-        echo "📤 Logging into Docker Hub..."
-        echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u "${{ env.DOCKERHUB_USERNAME }}" --password-stdin
-        
-        echo "Pushing backend..."
-        docker push ${{ env.DOCKERHUB_USERNAME }}/youraws-backend:${{ needs.prepare.outputs.main_sha }}
-        
-        echo "Pushing frontend..."
-        docker push ${{ env.DOCKERHUB_USERNAME }}/youraws-frontend:${{ needs.prepare.outputs.main_sha }}
-        
-        echo "✅ Images pushed to Docker Hub"
-
-  # JOB 3: Deploy to EC2
   deploy:
     runs-on: ubuntu-latest
-    needs: [prepare, build]
-    if: needs.prepare.outputs.safe_to_deploy == 'true'
-    
     steps:
-    - name: Configure AWS Credentials
-      uses: aws-actions/configure-aws-credentials@v4
-      with:
-        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        aws-region: ${{ env.AWS_REGION }}
-    
-    - name: Find EC2 Instances
-      id: find-instances
-      run: |
-        echo "🔍 Finding EC2 instances..."
-        
-        # Try multiple ways to find instances
-        INSTANCE_IDS=$(aws ec2 describe-instances \
-          --filters "Name=tag:Application,Values=uraws" \
-                    "Name=instance-state-name,Values=running" \
-          --query "Reservations[].Instances[].InstanceId" \
-          --output text)
-        
-        if [ -z "$INSTANCE_IDS" ]; then
-          echo "Looking for instances with 'uraws' in name..."
-          INSTANCE_IDS=$(aws ec2 describe-instances \
-            --query "Reservations[].Instances[?Tags[?Key=='Name' && contains(Value, 'uraws')] && State.Name=='running'].InstanceId" \
-            --output text)
-        fi
-        
-        if [ -z "$INSTANCE_IDS" ]; then
-          echo "Looking for ANY running instances..."
-          INSTANCE_IDS=$(aws ec2 describe-instances \
-            --filters "Name=instance-state-name,Values=running" \
-            --query "Reservations[].Instances[].InstanceId" \
-            --output text | head -5)
-        fi
-        
-        if [ -z "$INSTANCE_IDS" ]; then
-          echo "❌ No EC2 instances found"
-          exit 1
-        fi
-        
-        echo "Found instances: $INSTANCE_IDS"
-        echo "instance_ids=$INSTANCE_IDS" >> $GITHUB_OUTPUT
-        
-        COUNT=$(echo $INSTANCE_IDS | wc -w)
-        echo "count=$COUNT" >> $GITHUB_OUTPUT
-        
-        echo "✅ Found $COUNT instance(s)"
-    
-    - name: Deploy to Each Instance
-      env:
-        MAIN_SHA: ${{ needs.prepare.outputs.main_sha }}
-      run: |
-        echo "🚀 Starting deployment..."
-        
-        for INSTANCE_ID in ${{ steps.find-instances.outputs.instance_ids }}; do
-          echo ""
-          echo "========================================"
-          echo "Deploying to instance: $INSTANCE_ID"
-          echo "========================================"
-          
-          # Create deployment script
-          DEPLOY_SCRIPT=$(cat << 'SCRIPTEOF'
-#!/bin/bash
-set -e
-
-echo "🚀 DEPLOYMENT STARTED"
-echo "====================="
-echo "Image Tag: $1"
-echo "Timestamp: $(date)"
-echo ""
-
-# Create or navigate to app directory
-mkdir -p /opt/uraws/nginx
-cd /opt/uraws
-
-echo "1. Checking if docker-compose.yml exists..."
-if [ ! -f "docker-compose.yml" ]; then
-  echo "❌ docker-compose.yml not found in /opt/uraws"
-  echo "Please ensure the file exists before deployment"
-  exit 1
-fi
-
-echo "2. Creating backup..."
-cp docker-compose.yml "docker-compose.backup.$(date +%Y%m%d-%H%M%S).yml"
-echo "✅ Backup created"
-
-echo "3. Updating image tags..."
-sed -i "s|aarchtou/youraws-backend:latest|aarchtou/youraws-backend:$1|g" docker-compose.yml
-sed -i "s|aarchtou/youraws-frontend:latest|aarchtou/youraws-frontend:$1|g" docker-compose.yml
-echo "✅ Updated image tags to: $1"
-
-echo "4. Pulling new Docker images..."
-docker-compose pull || {
-  echo "❌ Failed to pull images"
-  echo "Trying to continue anyway..."
-}
-
-echo "5. Stopping old containers..."
-docker-compose down || true
-
-echo "6. Starting new containers..."
-docker-compose up -d || {
-  echo "❌ Failed to start containers"
-  exit 1
-}
-
-echo "7. Waiting for containers to start..."
-sleep 15
-
-echo "8. Checking container status..."
-docker-compose ps
-
-echo "9. Cleaning up old images..."
-docker image prune -af 2>/dev/null || true
-
-echo ""
-echo "✅ DEPLOYMENT COMPLETED"
-echo "====================="
-echo "Deployed tag: $1"
-echo "Completed at: $(date)"
-SCRIPTEOF
-)
-
-          echo "📤 Sending deployment command..."
-          
-          # Escape the script for SSM
-          ESCAPED_SCRIPT=$(echo "$DEPLOY_SCRIPT" | sed 's/"/\\"/g')
-          
+      - name: Get Main Branch SHA
+        id: sha
+        run: |
+          SHA=$(git ls-remote https://github.com/${{ github.repository }} refs/heads/main | cut -f1 | head -c 8)
+          echo "sha=$SHA" >> $GITHUB_OUTPUT
+          echo "✅ Main SHA: $SHA"
+      
+      - name: Configure AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION || 'us-east-1' }}
+      
+      - name: Deploy to EC2
+        env:
+          INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID }}
+          MAIN_SHA: ${{ steps.sha.outputs.sha }}
+        run: |
           aws ssm send-command \
             --instance-ids $INSTANCE_ID \
             --document-name "AWS-RunShellScript" \
-            --parameters "commands=[
-              'cd /tmp',
-              'cat > deploy.sh << \"DEPLOYEOF\"',
-              '$ESCAPED_SCRIPT',
-              'DEPLOYEOF',
-              'chmod +x deploy.sh',
-              './deploy.sh \"$MAIN_SHA\"'
-            ]" \
-            --output text
-          
-          echo "✅ Deployment command sent to $INSTANCE_ID"
-          
-          # Wait between instances if multiple
-          if [ "${{ steps.find-instances.outputs.count }}" -gt 1 ]; then
-            echo "⏳ Waiting 30 seconds before next instance..."
-            sleep 30
-          fi
-        done
-
-  # JOB 4: Verify Deployment
-  verify:
-    runs-on: ubuntu-latest
-    needs: deploy
-    if: always()
-    
-    steps:
-    - name: Wait for Deployment Completion
-      run: |
-        echo "⏳ Waiting 60 seconds for deployment to complete..."
-        sleep 60
-        echo "✅ Deployment should be complete"
-    
-    - name: Success Summary
-      if: success()
-      run: |
-        echo ""
-        echo "🎉 DEPLOYMENT PIPELINE COMPLETED"
-        echo "================================"
-        echo "✅ Images built with tag: ${{ needs.prepare.outputs.main_sha }}"
-        echo "✅ Deployment commands sent to: ${{ steps.find-instances.outputs.count }} instance(s)"
-        echo ""
-        echo "📝 MANUAL VERIFICATION REQUIRED:"
-        echo "================================="
-        echo "1. SSH into your EC2 instance:"
-        echo "   ssh -i your-key.pem ubuntu@YOUR_EC2_IP"
-        echo ""
-        echo "2. Check deployment status:"
-        echo "   cd /opt/uraws"
-        echo "   docker-compose ps"
-        echo "   docker-compose logs"
-        echo ""
-        echo "3. Test the application:"
-        echo "   curl http://localhost/health"
-        echo ""
-        echo "⚠️ NOTE: This pipeline only sends deployment commands."
-        echo "You must manually verify the deployment was successful."
-    
-    - name: Failure Summary
-      if: failure()
-      run: |
-        echo ""
-        echo "❌ DEPLOYMENT PIPELINE FAILED"
-        echo "============================="
-        echo ""
-        echo "🔧 TROUBLESHOOTING STEPS:"
-        echo "1. Check AWS IAM permissions"
-        echo "2. Verify EC2 instance is running"
-        echo "3. Check SSM agent is installed on EC2"
-        echo "4. Review GitHub Actions logs above"
-        echo ""
-        echo "📋 COMMON SOLUTIONS:"
-        echo "- Ensure IAM user has: ec2:DescribeInstances and ssm:SendCommand"
-        echo "- Ensure EC2 instance has SSM agent: sudo snap install amazon-ssm-agent"
-        echo "- Check EC2 security group allows SSM (port 443)"
+            --parameters 'commands=[
+              "cd /opt/uraws",
+              "sed -i \"s|aarchtou/youraws-backend:latest|aarchtou/youraws-backend:'"$MAIN_SHA"'|g\" docker-compose.yml",
+              "sed -i \"s|aarchtou/youraws-frontend:latest|aarchtou/youraws-frontend:'"$MAIN_SHA"'|g\" docker-compose.yml",
+              "docker compose pull",
+              "docker compose down",
+              "docker compose up -d",
+              "echo Deployment complete"
+            ]'
