@@ -1,160 +1,150 @@
-name: Production Deployment Pipeline
+name: Release Branch Deployment Pipeline
 on:
   push:
     branches:
       - release
     paths:
       - 'deploy-trigger.txt'
-      - 'docker-compose.yml'
-      - 'backend/**'
-      - 'frontend/**'
-      - 'nginx/**'
 
 env:
-  DOCKERHUB_NAMESPACE: aarchtou  # Your Docker Hub username
+  DOCKERHUB_USERNAME: 'aarchtou'
   DEPLOYMENT_ID: deploy-$(date +%Y%m%d-%H%M%S)-${GITHUB_SHA:0:8}
-  AWS_REGION: us-east-1
+  AWS_REGION: 'us-east-1'
 
 jobs:
-  # JOB 1: Validation & Safety Checks
-  validate:
+  # JOB 1: Safety Validation
+  safety-check:
     runs-on: ubuntu-latest
     outputs:
-      safe_to_proceed: ${{ steps.safety.outputs.safe }}
+      safe_to_proceed: ${{ steps.check.outputs.safe }}
+      main_branch_sha: ${{ steps.get-sha.outputs.sha }}
     
     steps:
-    - name: Checkout Code
+    - name: Checkout Release Branch
       uses: actions/checkout@v4
       with:
         ref: release
+    
+    - name: Get Main Branch SHA
+      id: get-sha
+      run: |
+        echo "📦 Fetching main branch info..."
+        
+        # Get the SHA of the latest commit on main branch
+        MAIN_SHA=$(git ls-remote https://github.com/${{ github.repository }} refs/heads/main | cut -f1)
+        
+        if [ -z "$MAIN_SHA" ]; then
+          echo "❌ Cannot fetch main branch SHA"
+          exit 1
+        fi
+        
+        SHORT_SHA=${MAIN_SHA:0:8}
+        echo "main_sha=$SHORT_SHA" >> $GITHUB_OUTPUT
+        echo "✅ Main branch SHA: $SHORT_SHA"
+    
+    - name: Validate Safety Lock
+      id: check
+      env:
+        SAFETY_LOCK: ${{ secrets.SAFETY_LOCK_ENABLED || 'true' }}
+      run: |
+        if [ "$SAFETY_LOCK" = "true" ]; then
+          echo "🔒 SAFETY LOCK ENABLED"
+          echo "::notice::To deploy, set SAFETY_LOCK_ENABLED=false in GitHub Secrets"
+          echo "safe=false" >> $GITHUB_OUTPUT
+        else
+          echo "✅ Safety lock disabled"
+          echo "safe=true" >> $GITHUB_OUTPUT
+        fi
+
+  # JOB 2: Build Images from Main Branch
+  build-images:
+    runs-on: ubuntu-latest
+    needs: safety-check
+    if: needs.safety-check.outputs.safe_to_proceed == 'true'
+    
+    steps:
+    - name: Checkout Main Branch (for building)
+      uses: actions/checkout@v4
+      with:
+        ref: main
+        path: ./app-code
     
     - name: Validate Docker Compose
       run: |
         echo "🔍 Validating infrastructure..."
         
-        # Test that docker compose is valid
-        docker compose config --quiet || {
+        # Go to app-code directory where docker-compose.yml is
+        cd app-code
+        
+        # Test that docker-compose is valid
+        docker-compose config --quiet || {
           echo "❌ Invalid docker-compose.yml"
           exit 1
         }
         
-        # Check required directories
-        if [ ! -d "backend" ]; then
-          echo "⚠️ Warning: No backend directory"
-        fi
-        
-        if [ ! -d "frontend" ]; then
-          echo "⚠️ Warning: No frontend directory"
-        fi
-        
-        echo "✅ Validation passed"
+        echo "✅ Docker Compose validation passed"
     
-    - name: Check Safety Lock
-      id: safety
-      env:
-        SAFETY_LOCK: ${{ secrets.SAFETY_LOCK_ENABLED || 'true' }}
-      run: |
-        if [ "$SAFETY_LOCK" = "true" ]; then
-          echo "🔒 SAFETY LOCK ENABLED - Deployment blocked"
-          echo "::notice::To deploy, set SAFETY_LOCK_ENABLED=false in GitHub Secrets"
-          echo "safe=false" >> $GITHUB_OUTPUT
-        else
-          echo "✅ Safety lock disabled - Ready for deployment"
-          echo "safe=true" >> $GITHUB_OUTPUT
-        fi
-
-  # JOB 2: Build & Push Public Images
-  build-and-push:
-    runs-on: ubuntu-latest
-    needs: validate
-    if: needs.validate.outputs.safe_to_proceed == 'true'
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
     
-    steps:
-    - name: Checkout Code
-      uses: actions/checkout@v4
-    
-    - name: Login to Docker Hub (for pushing)
+    - name: Login to Docker Hub
       continue-on-error: true
       uses: docker/login-action@v3
       with:
-        username: ${{ secrets.DOCKERHUB_USERNAME || 'aarchtou' }}
+        username: ${{ env.DOCKERHUB_USERNAME }}
         password: ${{ secrets.DOCKERHUB_TOKEN }}
     
-    # Build Backend
-    - name: Build Backend Image
-      id: build-backend
+    - name: Build and Push Backend
+      env:
+        IMAGE_TAG: ${{ needs.safety-check.outputs.main_branch_sha }}
       run: |
-        echo "🔨 Building Backend image..."
+        echo "🔨 Building backend image..."
         
-        if [ -f "backend/Dockerfile" ]; then
-          cd backend
-          docker build -t ${{ env.DOCKERHUB_NAMESPACE }}/youraws-backend:${{ env.DEPLOYMENT_ID }} .
-          docker tag ${{ env.DOCKERHUB_NAMESPACE }}/youraws-backend:${{ env.DEPLOYMENT_ID }} ${{ env.DOCKERHUB_NAMESPACE }}/youraws-backend:latest
-          echo "backend_image=${{ env.DOCKERHUB_NAMESPACE }}/youraws-backend:${{ env.DEPLOYMENT_ID }}" >> $GITHUB_OUTPUT
-          echo "✅ Backend image built"
+        cd app-code/backend
+        
+        # Build with main branch SHA as tag
+        docker build -t ${{ env.DOCKERHUB_USERNAME }}/youraws-backend:$IMAGE_TAG .
+        docker tag ${{ env.DOCKERHUB_USERNAME }}/youraws-backend:$IMAGE_TAG ${{ env.DOCKERHUB_USERNAME }}/youraws-backend:latest
+        
+        if [ -n "${{ secrets.DOCKERHUB_TOKEN }}" ]; then
+          echo "📤 Pushing to Docker Hub..."
+          docker push ${{ env.DOCKERHUB_USERNAME }}/youraws-backend:$IMAGE_TAG
+          docker push ${{ env.DOCKERHUB_USERNAME }}/youraws-backend:latest
+          echo "✅ Backend image pushed: ${{ env.DOCKERHUB_USERNAME }}/youraws-backend:$IMAGE_TAG"
         else
-          echo "⚠️ No backend/Dockerfile found"
-          echo "backend_image=skip" >> $GITHUB_OUTPUT
+          echo "⚠️ No Docker Hub token, image built locally only"
+          echo "✅ Backend image built: ${{ env.DOCKERHUB_USERNAME }}/youraws-backend:$IMAGE_TAG"
         fi
     
-    - name: Push Backend to Docker Hub
-      if: steps.build-backend.outputs.backend_image != 'skip'
-      continue-on-error: true
+    - name: Build and Push Frontend
+      env:
+        IMAGE_TAG: ${{ needs.safety-check.outputs.main_branch_sha }}
       run: |
-        echo "📤 Pushing Backend to Docker Hub..."
-        docker push ${{ env.DOCKERHUB_NAMESPACE }}/youraws-backend:${{ env.DEPLOYMENT_ID }}
-        docker push ${{ env.DOCKERHUB_NAMESPACE }}/youraws-backend:latest
-        echo "✅ Backend pushed to Docker Hub (public)"
-    
-    # Build Frontend
-    - name: Build Frontend Image
-      id: build-frontend
-      run: |
-        echo "🔨 Building Frontend image..."
+        echo "🔨 Building frontend image..."
         
-        if [ -f "frontend/Dockerfile" ]; then
-          cd frontend
-          docker build -t ${{ env.DOCKERHUB_NAMESPACE }}/youraws-frontend:${{ env.DEPLOYMENT_ID }} .
-          docker tag ${{ env.DOCKERHUB_NAMESPACE }}/youraws-frontend:${{ env.DEPLOYMENT_ID }} ${{ env.DOCKERHUB_NAMESPACE }}/youraws-frontend:latest
-          echo "frontend_image=${{ env.DOCKERHUB_NAMESPACE }}/youraws-frontend:${{ env.DEPLOYMENT_ID }}" >> $GITHUB_OUTPUT
-          echo "✅ Frontend image built"
+        cd app-code/frontend
+        
+        # Build with main branch SHA as tag
+        docker build -t ${{ env.DOCKERHUB_USERNAME }}/youraws-frontend:$IMAGE_TAG .
+        docker tag ${{ env.DOCKERHUB_USERNAME }}/youraws-frontend:$IMAGE_TAG ${{ env.DOCKERHUB_USERNAME }}/youraws-frontend:latest
+        
+        if [ -n "${{ secrets.DOCKERHUB_TOKEN }}" ]; then
+          echo "📤 Pushing to Docker Hub..."
+          docker push ${{ env.DOCKERHUB_USERNAME }}/youraws-frontend:$IMAGE_TAG
+          docker push ${{ env.DOCKERHUB_USERNAME }}/youraws-frontend:latest
+          echo "✅ Frontend image pushed: ${{ env.DOCKERHUB_USERNAME }}/youraws-frontend:$IMAGE_TAG"
         else
-          echo "⚠️ No frontend/Dockerfile found"
-          echo "frontend_image=skip" >> $GITHUB_OUTPUT
+          echo "⚠️ No Docker Hub token, image built locally only"
+          echo "✅ Frontend image built: ${{ env.DOCKERHUB_USERNAME }}/youraws-frontend:$IMAGE_TAG"
         fi
     
-    - name: Push Frontend to Docker Hub
-      if: steps.build-frontend.outputs.frontend_image != 'skip'
-      continue-on-error: true
+    - name: Generate Production Docker Compose
       run: |
-        echo "📤 Pushing Frontend to Docker Hub..."
-        docker push ${{ env.DOCKERHUB_NAMESPACE }}/youraws-frontend:${{ env.DEPLOYMENT_ID }}
-        docker push ${{ env.DOCKERHUB_NAMESPACE }}/youraws-frontend:latest
-        echo "✅ Frontend pushed to Docker Hub (public)"
-    
-    - name: Generate Deployment Script
-      id: generate-script
-      run: |
-        echo "📝 Generating deployment script..."
+        echo "📄 Generating production docker-compose.yml..."
         
-        cat > deploy.sh << 'DEPLOYEOF'
-        #!/bin/bash
-        set -e
+        cd app-code
         
-        echo "🚀 Starting deployment on $(date)"
-        echo "Deployment ID: $1"
-        
-        DOCKERHUB_NAMESPACE="aarchtou"
-        DEPLOYMENT_ID="$1"
-        APP_DIR="/opt/uraws"
-        
-        cd $APP_DIR || { echo "❌ Directory $APP_DIR not found"; exit 1; }
-        
-        if [ -f "docker-compose.yml" ]; then
-          cp docker-compose.yml "docker-compose.backup.$(date +%Y%m%d-%H%M%S).yml"
-        fi
-        
-        cat > docker-compose.yml << 'DCEOF'
+        cat > ../docker-compose.prod.yml << 'EOFMARKER'
         version: '3.8'
         
         services:
@@ -163,29 +153,39 @@ jobs:
             container_name: youraws-mysql
             restart: unless-stopped
             environment:
-              MYSQL_ROOT_PASSWORD: rootpassword
+              MYSQL_ROOT_PASSWORD: ${DB_PASSWORD:-rootpassword}
               MYSQL_DATABASE: userdb
             volumes:
               - mysql_data:/var/lib/mysql
             networks:
               - app-network
+            healthcheck:
+              test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+              timeout: 20s
+              retries: 10
         
           backend:
-            image: ${DOCKERHUB_NAMESPACE}/youraws-backend:${DEPLOYMENT_ID}
+            image: ${DOCKERHUB_USERNAME}/youraws-backend:${IMAGE_TAG}
             container_name: youraws-backend
             restart: unless-stopped
             depends_on:
-              - mysql
+              mysql:
+                condition: service_healthy
             environment:
-              DATABASE_URL: mysql://root:rootpassword@mysql:3306/userdb
+              DATABASE_URL: mysql://root:${DB_PASSWORD:-rootpassword}@mysql:3306/userdb
               PORT: 5000
               NODE_ENV: production
               CORS_ORIGIN: "*"
             networks:
               - app-network
+            healthcheck:
+              test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:5000/health"]
+              interval: 30s
+              timeout: 10s
+              retries: 3
         
           frontend:
-            image: ${DOCKERHUB_NAMESPACE}/youraws-frontend:${DEPLOYMENT_ID}
+            image: ${DOCKERHUB_USERNAME}/youraws-frontend:${IMAGE_TAG}
             container_name: youraws-frontend
             restart: unless-stopped
             networks:
@@ -212,43 +212,20 @@ jobs:
         volumes:
           mysql_data:
             driver: local
-        DCEOF
+        EOFMARKER
         
-        echo "📄 Created docker-compose.yml with image tag: ${DEPLOYMENT_ID}"
+        sed -i "s/\${DOCKERHUB_USERNAME}/${{ env.DOCKERHUB_USERNAME }}/g" ../docker-compose.prod.yml
+        sed -i "s/\${IMAGE_TAG}/${{ needs.safety-check.outputs.main_branch_sha }}/g" ../docker-compose.prod.yml
         
-        echo "⬇️ Pulling Docker images..."
-        docker compose pull
-        
-        echo "🛑 Stopping old containers..."
-        docker compose down
-        
-        echo "▶️ Starting new containers..."
-        docker compose up -d
-        
-        echo "🧹 Cleaning up old images..."
-        docker image prune -af --filter "until=24h"
-        
-        echo "✅ Deployment completed successfully!"
-        echo "🔍 Checking container status..."
-        docker compose ps
-        
-        echo "🏥 Running health checks..."
-        sleep 10
-        if curl -s http://localhost:80/health > /dev/null; then
-          echo "✅ Health check passed"
-        else
-          echo "⚠️ Health check endpoint not responding, but containers are running"
-        fi
-        DEPLOYEOF
-        
-        chmod +x deploy.sh
-        echo "✅ Deployment script generated"
+        echo "✅ Generated docker-compose.prod.yml"
+        echo "--- Preview ---"
+        head -20 ../docker-compose.prod.yml
 
-  # JOB 3: Deploy to EC2 (Simplified - No Docker Hub Login Needed)
+  # JOB 3: Deploy to EC2
   deploy:
     runs-on: ubuntu-latest
-    needs: [validate, build-and-push]
-    if: needs.validate.outputs.safe_to_proceed == 'true'
+    needs: [safety-check, build-images]
+    if: needs.safety-check.outputs.safe_to_proceed == 'true'
     
     steps:
     - name: Configure AWS Credentials
@@ -258,134 +235,133 @@ jobs:
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         aws-region: ${{ env.AWS_REGION }}
     
-    - name: Find EC2 Instances by Tags
+    - name: Find EC2 Instances
       id: find-instances
       run: |
         echo "🔍 Finding EC2 instances..."
         
-        # Find all running instances with the right tags
+        # Try to find instances with uraws in name
         INSTANCE_IDS=$(aws ec2 describe-instances \
-          --filters \
-            "Name=tag:Name,Values=uraws-*" \
-            "Name=tag:Environment,Values=production" \
-            "Name=instance-state-name,Values=running" \
-          --query "Reservations[].Instances[].InstanceId" \
+          --query "Reservations[].Instances[?Tags[?Key=='Name' && contains(Value, 'uraws')] && State.Name=='running'].InstanceId" \
           --output text)
         
         if [ -z "$INSTANCE_IDS" ]; then
-          echo "❌ No EC2 instances found with matching tags"
-          echo "Trying alternative tag search..."
-          
-          # Try alternative tag patterns
+          echo "Trying any running instance..."
           INSTANCE_IDS=$(aws ec2 describe-instances \
-            --filters "Name=tag:Application,Values=uraws" \
-                      "Name=instance-state-name,Values=running" \
+            --filters "Name=instance-state-name,Values=running" \
             --query "Reservations[].Instances[].InstanceId" \
-            --output text)
+            --output text | head -5)
         fi
         
         if [ -z "$INSTANCE_IDS" ]; then
-          echo "::error::No EC2 instances found. Please check your tags."
-          echo "Current tags in your account:"
-          aws ec2 describe-instances \
-            --query "Reservations[].Instances[].[InstanceId,State.Name,Tags]" \
-            --output table | head -20
+          echo "::error::No running EC2 instances found"
+          echo "Please ensure you have at least one running EC2 instance"
           exit 1
         fi
         
         echo "Found instances: $INSTANCE_IDS"
         echo "instance_ids=$INSTANCE_IDS" >> $GITHUB_OUTPUT
         
-        # Count for output
         COUNT=$(echo $INSTANCE_IDS | wc -w)
         echo "count=$COUNT" >> $GITHUB_OUTPUT
-    
-    - name: Deploy to EC2 Instances (Zero-Downtime)
-      env:
-        DEPLOYMENT_ID: ${{ env.DEPLOYMENT_ID }}
-      run: |
-        echo "🚀 Starting deployment to ${{ steps.find-instances.outputs.count }} instance(s)"
         
-        INSTANCE_COUNTER=1
-        for INSTANCE_ID in ${{ steps.find-instances.outputs.instance_ids }}; do
-          echo ""
-          echo "=========================================="
-          echo "Instance $INSTANCE_COUNTER: $INSTANCE_ID"
-          echo "=========================================="
-          
-          # Step 1: Create directory structure
-          echo "📁 Setting up directory structure..."
-          aws ssm send-command \
-            --instance-ids $INSTANCE_ID \
-            --document-name "AWS-RunShellScript" \
-            --parameters 'commands=[
-              "sudo mkdir -p /opt/uraws/nginx",
-              "sudo chown -R ubuntu:ubuntu /opt/uraws || true",
-              "cd /opt/uraws"
-            ]' \
-            --output text
-          
-          # Step 2: Upload nginx config (if exists)
-          if [ -f "nginx/nginx.conf" ]; then
-            echo "📄 Uploading nginx configuration..."
-            NGINX_CONFIG=$(cat nginx/nginx.conf | sed 's/"/\\"/g')
-            aws ssm send-command \
-              --instance-ids $INSTANCE_ID \
-              --document-name "AWS-RunShellScript" \
-              --parameters "commands=[
-                'cat > /opt/uraws/nginx/nginx.conf << \"NGINXEOF\"',
-                '$NGINX_CONFIG',
-                'NGINXEOF'
-              ]" \
-              --output text
-          fi
-          
-          # Step 3: Upload and execute deployment script
-          echo "⚡ Executing deployment..."
-          
-          # Read the deploy.sh script and escape it for SSM
-          DEPLOY_SCRIPT=$(cat deploy.sh | sed 's/"/\\"/g')
-          
-          aws ssm send-command \
-            --instance-ids $INSTANCE_ID \
-            --document-name "AWS-RunShellScript" \
-            --parameters "commands=[
-              'cd /opt/uraws',
-              'cat > deploy.sh << \"DEPLOYEOF\"',
-              '$DEPLOY_SCRIPT',
-              'DEPLOYEOF',
-              'chmod +x deploy.sh',
-              './deploy.sh \"$DEPLOYMENT_ID\"'
-            ]" \
-            --output text
-          
-          # Step 4: Wait for this instance to be healthy before next
-          if [ $INSTANCE_COUNTER -lt ${{ steps.find-instances.outputs.count }} ]; then
-            echo "⏳ Waiting for instance to stabilize before next deployment..."
-            sleep 30
-            
-            # Quick health check
-            echo "🏥 Checking instance health..."
-            aws ssm send-command \
-              --instance-ids $INSTANCE_ID \
-              --document-name "AWS-RunShellScript" \
-              --parameters 'commands=[
-                "cd /opt/uraws",
-                "docker compose ps | grep -c \"Up\""
-              ]' \
-              --output text
-          fi
-          
-          INSTANCE_COUNTER=$((INSTANCE_COUNTER + 1))
-        done
-        
-        echo ""
-        echo "✅ All instances deployment initiated"
+        echo "✅ Found $COUNT instance(s)"
 
-  # JOB 4: Final Verification
+  # JOB 4: Execute Deployment
+  execute-deployment:
+    runs-on: ubuntu-latest
+    needs: [deploy, build-images]
+    
+    steps:
+    - name: Get Instance ID
+      id: get-instance
+      run: |
+        # Convert instance IDs to array and take first one
+        INSTANCE_IDS=(${{ needs.deploy.outputs.instance_ids }})
+        INSTANCE_ID=${INSTANCE_IDS[0]}
+        
+        echo "instance_id=$INSTANCE_ID" >> $GITHUB_OUTPUT
+        echo "📦 Deploying to instance: $INSTANCE_ID"
+    
+    - name: Deploy to EC2 via SSM
+      env:
+        INSTANCE_ID: ${{ steps.get-instance.outputs.instance_id }}
+        MAIN_SHA: ${{ needs.safety-check.outputs.main_branch_sha }}
+        DOCKERHUB_USERNAME: ${{ env.DOCKERHUB_USERNAME }}
+      run: |
+        echo "📝 Deploying to EC2..."
+        
+        aws ssm send-command \
+          --instance-ids $INSTANCE_ID \
+          --document-name "AWS-RunShellScript" \
+          --comment "Deploy $MAIN_SHA" \
+          --parameters 'commands=[
+            "set -e",
+            "echo Deploying to /opt/uraws",
+            "sudo mkdir -p /opt/uraws",
+            "cd /opt/uraws",
+            "sudo tee docker-compose.yml > /dev/null <<DCEOF",
+            "version: \"3.8\"",
+            "services:",
+            "  mysql:",
+            "    image: mysql:8.0",
+            "    container_name: youraws-mysql",
+            "    restart: unless-stopped",
+            "    environment:",
+            "      MYSQL_ROOT_PASSWORD: rootpassword",
+            "      MYSQL_DATABASE: userdb",
+            "    volumes:",
+            "      - mysql_data:/var/lib/mysql",
+            "    networks:",
+            "      - app-network",
+            "  backend:",
+            "    image: '"$DOCKERHUB_USERNAME"'/youraws-backend:'"$MAIN_SHA"'",
+            "    container_name: youraws-backend",
+            "    restart: unless-stopped",
+            "    depends_on:",
+            "      - mysql",
+            "    environment:",
+            "      DATABASE_URL: mysql://root:rootpassword@mysql:3306/userdb",
+            "      PORT: 5000",
+            "      NODE_ENV: production",
+            "    networks:",
+            "      - app-network",
+            "  frontend:",
+            "    image: '"$DOCKERHUB_USERNAME"'/youraws-frontend:'"$MAIN_SHA"'",
+            "    container_name: youraws-frontend",
+            "    restart: unless-stopped",
+            "    networks:",
+            "      - app-network",
+            "  nginx:",
+            "    image: nginx:alpine",
+            "    container_name: youraws-nginx",
+            "    restart: unless-stopped",
+            "    ports:",
+            "      - \"80:80\"",
+            "    networks:",
+            "      - app-network",
+            "networks:",
+            "  app-network:",
+            "    driver: bridge",
+            "volumes:",
+            "  mysql_data:",
+            "    driver: local",
+            "DCEOF",
+            "sudo docker-compose down || true",
+            "sudo docker-compose pull",
+            "sudo docker-compose up -d",
+            "sleep 10",
+            "sudo docker-compose ps",
+            "echo Deployment complete"
+          ]' \
+          --output text
+        
+        echo "✅ Deployment command sent"
+
+  # JOB 5: Verification
   verify:
     runs-on: ubuntu-latest
-    needs: deploy
+    needs: execute-deployment
     if: always()
     
     steps:
@@ -396,100 +372,92 @@ jobs:
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         aws-region: ${{ env.AWS_REGION }}
     
-    - name: Verify Load Balancer
-      env:
-        ALB_DNS: ${{ secrets.ALB_DNS_NAME }}
+    - name: Get Instance Public IP
+      id: get-ip
       run: |
-        echo "🔍 Verifying deployment via Load Balancer..."
+        INSTANCE_IDS=(${{ needs.deploy.outputs.instance_ids }})
+        INSTANCE_ID=${INSTANCE_IDS[0]}
         
-        if [ -z "$ALB_DNS" ]; then
-          echo "⚠️ ALB_DNS_NAME not configured, skipping LB check"
-          exit 0
+        PUBLIC_IP=$(aws ec2 describe-instances \
+          --instance-ids $INSTANCE_ID \
+          --query "Reservations[0].Instances[0].PublicIpAddress" \
+          --output text)
+        
+        if [ -z "$PUBLIC_IP" ] || [ "$PUBLIC_IP" = "None" ]; then
+          echo "instance_ip=not_available" >> $GITHUB_OUTPUT
+          echo "⚠️ Instance has no public IP"
+        else
+          echo "instance_ip=$PUBLIC_IP" >> $GITHUB_OUTPUT
+          echo "✅ Instance public IP: $PUBLIC_IP"
         fi
+    
+    - name: Verify Application
+      if: steps.get-ip.outputs.instance_ip != 'not_available'
+      env:
+        INSTANCE_IP: ${{ steps.get-ip.outputs.instance_ip }}
+      run: |
+        echo "🔍 Verifying application on $INSTANCE_IP..."
         
-        echo "Testing Load Balancer: $ALB_DNS"
-        
+        # Try health check first
         for i in {1..10}; do
           echo "Attempt $i/10..."
           
-          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://$ALB_DNS/" || echo "000")
+          if curl -s -f "http://$INSTANCE_IP/health" > /dev/null; then
+            echo "✅ Health check passed"
+            break
+          else
+            echo "Health check failed, waiting 10 seconds..."
+            sleep 10
+          fi
           
-          case $HTTP_CODE in
-            200|301|302)
-              echo "✅ Load Balancer responding with HTTP $HTTP_CODE"
-              
-              # Try to get actual content
-              if curl -s "http://$ALB_DNS/health" | grep -q "healthy"; then
-                echo "✅ Application health endpoint is healthy"
-              elif curl -s "http://$ALB_DNS/" | head -c 100 | grep -q "<html"; then
-                echo "✅ HTML content served successfully"
-              fi
-              
-              echo "🚀 DEPLOYMENT VERIFIED SUCCESSFULLY!"
-              exit 0
-              ;;
-            *)
-              echo "Got HTTP $HTTP_CODE, retrying in 10 seconds..."
-              sleep 10
-              ;;
-          esac
+          if [ $i -eq 10 ]; then
+            echo "❌ Health check failed after 10 attempts"
+            exit 1
+          fi
         done
         
-        echo "❌ Load Balancer verification failed after 10 attempts"
-        echo "Last HTTP code: $HTTP_CODE"
-        
-        # Try to get more debug info
-        echo "Debug info:"
-        curl -v "http://$ALB_DNS/" 2>&1 | head -20 || true
-        
-        exit 1
-    
-    - name: Rollback if Verification Fails
-      if: failure() && steps.find-instances.outputs.instance_ids != ''
-      run: |
-        echo "🔄 Verification failed - Initiating rollback..."
-        
-        # Get all instances
-        INSTANCE_IDS="${{ steps.find-instances.outputs.instance_ids }}"
-        
-        for INSTANCE_ID in $INSTANCE_IDS; do
-          echo "Rolling back instance: $INSTANCE_ID"
-          
-          aws ssm send-command \
-            --instance-ids $INSTANCE_ID \
-            --document-name "AWS-RunShellScript" \
-            --parameters 'commands=[
-              "cd /opt/uraws",
-              "echo \"Looking for backup files...\"",
-              "BACKUP_FILE=$(ls -t docker-compose.backup.*.yml 2>/dev/null | head -1)",
-              "if [ -n \"$BACKUP_FILE\" ]; then",
-              "  echo \"Found backup: $BACKUP_FILE\"",
-              "  cp \"$BACKUP_FILE\" docker-compose.yml",
-              "  docker compose down",
-              "  docker compose up -d",
-              "  echo \"Rollback completed\"",
-              "else",
-              "  echo \"No backup found. Checking current status...\"",
-              "  docker compose ps",
-              "fi"
-            ]' \
-            --output text
-        done
-        
-        echo "✅ Rollback initiated on all instances"
+        # Try main page
+        echo "Testing main page..."
+        if curl -s "http://$INSTANCE_IP" | head -c 100 | grep -q -i "html\|react"; then
+          echo "✅ Frontend is serving HTML content"
+        else
+          echo "⚠️ Frontend response doesn't look like HTML"
+        fi
     
     - name: Success Summary
       if: success()
       run: |
         echo ""
-        echo "🎉🎉🎉 DEPLOYMENT COMPLETE 🎉🎉🎉"
-        echo "======================================"
+        echo "🎉🎉🎉 DEPLOYMENT SUCCESSFUL! 🎉🎉🎉"
+        echo "=========================================="
         echo "Deployment ID: ${{ env.DEPLOYMENT_ID }}"
-        echo "Timestamp: $(date)"
-        echo "Images built:"
-        echo "  Backend: aarchtou/youraws-backend:${{ env.DEPLOYMENT_ID }}"
-        echo "  Frontend: aarchtou/youraws-frontend:${{ env.DEPLOYMENT_ID }}"
-        echo "Deployed to: ${{ steps.find-instances.outputs.count }} instance(s)"
-        echo "Load Balancer: ${{ secrets.ALB_DNS_NAME || 'Not configured' }}"
-        echo "======================================"
+        echo "Main Branch SHA: ${{ needs.safety-check.outputs.main_branch_sha }}"
+        echo "Docker Images:"
+        echo "  Backend: ${{ env.DOCKERHUB_USERNAME }}/youraws-backend:${{ needs.safety-check.outputs.main_branch_sha }}"
+        echo "  Frontend: ${{ env.DOCKERHUB_USERNAME }}/youraws-frontend:${{ needs.safety-check.outputs.main_branch_sha }}"
+        echo "Deployed to: ${{ needs.deploy.outputs.count }} instance(s)"
+        
+        if [ "${{ steps.get-ip.outputs.instance_ip }}" != "not_available" ]; then
+          echo "Access your application at:"
+          echo "  http://${{ steps.get-ip.outputs.instance_ip }}"
+          echo "  http://${{ steps.get-ip.outputs.instance_ip }}/health"
+        fi
+        
+        echo "=========================================="
+    
+    - name: Failure Summary
+      if: failure()
+      run: |
         echo ""
+        echo "❌❌❌ DEPLOYMENT FAILED ❌❌❌"
+        echo "=========================================="
+        echo "Please check:"
+        echo "1. GitHub Actions logs above"
+        echo "2. EC2 instance logs:"
+        echo "   ssh -i your-key.pem ubuntu@YOUR_EC2_IP"
+        echo "   cd /opt/uraws"
+        echo "   docker-compose logs"
+        echo "3. Ensure EC2 instance has:"
+        echo "   - Docker and Docker Compose installed"
+        echo "   - Port 80 open in security group"
+        echo "=========================================="
