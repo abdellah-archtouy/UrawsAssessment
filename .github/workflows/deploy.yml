@@ -1,4 +1,4 @@
-name: Deploy to EC2
+name: Deploy to EC2 via SSM
 
 on:
   push:
@@ -7,14 +7,6 @@ on:
       - release
   workflow_dispatch:
     inputs:
-      environment:
-        description: 'Environment to deploy to'
-        required: true
-        default: 'staging'
-        type: choice
-        options:
-        - staging
-        - production
       force_rebuild:
         description: 'Force rebuild Docker images'
         required: false
@@ -22,17 +14,16 @@ on:
         type: boolean
 
 env:
-  DOCKER_COMPOSE_VERSION: 'v2.20.2'
+  DEPLOY_TIMEOUT: 600
   MAX_RETRIES: 3
-  DEPLOY_TIMEOUT: 600 # 10 minutes
 
 jobs:
-  preflight-checks:
+  preflight-check:
     runs-on: ubuntu-latest
     outputs:
       environment: ${{ steps.set-environment.outputs.environment }}
       release_id: ${{ steps.set-environment.outputs.release_id }}
-      deployment_mode: ${{ steps.check-ssm.outputs.deployment_mode }}
+      instance_ready: ${{ steps.check-ssm.outputs.instance_ready }}
     
     steps:
       - name: Checkout code
@@ -41,9 +32,7 @@ jobs:
       - name: Set environment variables
         id: set-environment
         run: |
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            ENVIRONMENT="${{ github.event.inputs.environment }}"
-          elif [[ "${{ github.ref }}" == "refs/heads/release" ]]; then
+          if [[ "${{ github.ref }}" == "refs/heads/release" ]]; then
             ENVIRONMENT="production"
           else
             ENVIRONMENT="staging"
@@ -68,7 +57,8 @@ jobs:
         run: |
           echo "🔍 Checking SSM connectivity..."
           
-          # Check if instance exists and is running
+          # Check if instance exists
+          echo "Checking EC2 instance status..."
           INSTANCE_STATE=$(aws ec2 describe-instances \
             --instance-ids "${{ secrets.EC2_INSTANCE_ID }}" \
             --query 'Reservations[0].Instances[0].State.Name' \
@@ -76,36 +66,48 @@ jobs:
           
           if [[ "$INSTANCE_STATE" != "running" ]]; then
             echo "❌ EC2 instance is not running (State: $INSTANCE_STATE)"
-            echo "deployment_mode=ssh" >> $GITHUB_OUTPUT
-            exit 0
+            echo "instance_ready=false" >> $GITHUB_OUTPUT
+            exit 1
           fi
           
+          echo "✅ EC2 instance is running"
+          
           # Check SSM agent status
+          echo "Checking SSM agent..."
           SSM_STATUS=$(aws ssm describe-instance-information \
             --filters "Key=InstanceIds,Values=${{ secrets.EC2_INSTANCE_ID }}" \
             --query 'InstanceInformationList[0].PingStatus' \
-            --output text 2>/dev/null || echo "Unavailable")
+            --output text 2>/dev/null || echo "Unknown")
           
           echo "SSM Ping Status: $SSM_STATUS"
           
           if [[ "$SSM_STATUS" == "Online" ]]; then
-            echo "✅ SSM is available"
-            echo "deployment_mode=ssm" >> $GITHUB_OUTPUT
+            echo "✅ SSM agent is online and ready"
+            echo "instance_ready=true" >> $GITHUB_OUTPUT
           else
-            echo "⚠️ SSM is not available, falling back to SSH"
-            echo "deployment_mode=ssh" >> $GITHUB_OUTPUT
+            echo "❌ SSM agent is not ready (Status: $SSM_STATUS)"
+            echo "instance_ready=false" >> $GITHUB_OUTPUT
+            
+            # Provide troubleshooting info
+            echo ""
+            echo "🔧 Troubleshooting steps:"
+            echo "1. Check if SSM agent is installed on the EC2 instance"
+            echo "2. Verify IAM role has 'AmazonSSMManagedInstanceCore' policy"
+            echo "3. Ensure VPC has SSM endpoints if using private subnet"
+            echo "4. Check security group allows outbound HTTPS (port 443)"
+            
+            exit 1
           fi
 
   deploy:
-    needs: preflight-checks
+    needs: preflight-check
+    if: needs.preflight-check.outputs.instance_ready == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
-        with:
-          fetch-depth: 0
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v2
@@ -114,362 +116,405 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
 
-      - name: Deploy via SSM
-        id: deploy-ssm
-        if: needs.preflight-checks.outputs.deployment_mode == 'ssm'
+      - name: Prepare deployment script
+        id: prepare-script
         run: |
-          set -e
-          
-          echo "🚀 Starting SSM deployment..."
-          echo "Environment: ${{ needs.preflight-checks.outputs.environment }}"
-          echo "Release ID: ${{ needs.preflight-checks.outputs.release_id }}"
-          
-          # Create deployment script
-          DEPLOY_SCRIPT=$(cat << 'EOF'
+          # Create a deployment script that will be executed on the EC2 instance
+          cat > /tmp/deploy.sh << 'DEPLOY_SCRIPT'
           #!/bin/bash
-          set -e
+          set -euo pipefail
           
-          echo "══════════════════════════════════════════════"
-          echo "🚀 Starting Deployment - $RELEASE_ID"
-          echo "══════════════════════════════════════════════"
-          echo "Environment:    $ENVIRONMENT"
-          echo "Release ID:     $RELEASE_ID"
-          echo "Branch:         $BRANCH"
-          echo "Commit:         $COMMIT_SHA"
-          echo "Timestamp:      $(date)"
-          echo "══════════════════════════════════════════════"
-          
-          # Configuration
-          DEPLOY_DIR="/home/ubuntu/myapp"
-          RELEASES_DIR="/home/ubuntu/releases"
-          LOG_FILE="/home/ubuntu/deployments/$RELEASE_ID.log"
-          DOCKER_COMPOSE_FILE="$DEPLOY_DIR/docker-compose.yml"
-          
-          # Create directories if they don't exist
-          mkdir -p "$RELEASES_DIR"
-          mkdir -p "/home/ubuntu/deployments"
-          mkdir -p "$DEPLOY_DIR"
-          
-          # Start logging
+          # Log everything to a file
+          LOG_DIR="/home/ubuntu/deployment-logs"
+          mkdir -p "$LOG_DIR"
+          LOG_FILE="$LOG_DIR/deploy-$(date +%Y%m%d-%H%M%S).log"
           exec > >(tee -a "$LOG_FILE") 2>&1
           
-          # Function to rollback on error
-          rollback() {
-            echo "❌ DEPLOYMENT FAILED - Attempting rollback..."
-            
-            if [ -d "$RELEASES_DIR/myapp-$RELEASE_ID" ]; then
-              echo "↩️ Rolling back to previous version..."
-              rm -rf "$DEPLOY_DIR"
-              cp -r "$RELEASES_DIR/myapp-$RELEASE_ID" "$DEPLOY_DIR"
-              cd "$DEPLOY_DIR"
-              
-              echo "🛑 Stopping current containers..."
-              docker compose down || true
-              
-              echo "🚀 Starting previous containers..."
-              docker compose up -d || true
-              
-              echo "✅ Rollback completed"
-            else
-              echo "⚠️ No backup available for rollback"
-            fi
-            
-            exit 1
+          echo "══════════════════════════════════════════════════════"
+          echo "🚀 STARTING DEPLOYMENT"
+          echo "══════════════════════════════════════════════════════"
+          echo "Timestamp:       $(date)"
+          echo "Environment:     $ENVIRONMENT"
+          echo "Release ID:      $RELEASE_ID"
+          echo "Branch:          $BRANCH"
+          echo "Commit:          $COMMIT_SHA"
+          echo "Force Rebuild:   $FORCE_REBUILD"
+          echo "══════════════════════════════════════════════════════"
+          
+          # Configuration
+          APP_DIR="/home/ubuntu/myapp"
+          BACKUP_DIR="/home/ubuntu/app-backups"
+          MAX_BACKUPS=3
+          
+          # Function to handle errors
+          handle_error() {
+            local exit_code=$?
+            local line_number=$1
+            echo "❌ DEPLOYMENT FAILED"
+            echo "Error on line $line_number, exit code: $exit_code"
+            echo "Check log file: $LOG_FILE"
+            exit $exit_code
           }
           
-          trap rollback ERR
+          trap 'handle_error $LINENO' ERR
           
-          echo "[1/8] 📊 System check..."
-          echo "• Disk usage: $(df -h /home | tail -1)"
-          echo "• Memory: $(free -h | grep Mem | awk '{print $3"/"$2}')"
-          echo "• Docker: $(docker --version)"
-          echo "• Docker Compose: $(docker compose version)"
+          # Step 1: System check
+          echo ""
+          echo "🔍 [1/7] SYSTEM CHECK"
+          echo "----------------------------------------"
+          echo "• Hostname: $(hostname)"
+          echo "• Uptime: $(uptime -p)"
+          echo "• OS: $(lsb_release -d 2>/dev/null | cut -f2 || cat /etc/os-release | grep PRETTY_NAME | cut -d= -f2 | tr -d '\"')"
+          echo "• Disk usage:"
+          df -h /home
+          echo "• Memory:"
+          free -h
           
-          echo "[2/8] 💾 Creating backup..."
-          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-          if [ -d "$DEPLOY_DIR" ]; then
-            BACKUP_DIR="$RELEASES_DIR/myapp-$RELEASE_ID"
-            cp -r "$DEPLOY_DIR" "$BACKUP_DIR"
-            echo "✅ Backup created: $BACKUP_DIR"
-            
-            # Clean old backups (keep last 5)
-            echo "🧹 Cleaning old backups..."
-            ls -dt $RELEASES_DIR/myapp-* | tail -n +6 | xargs rm -rf 2>/dev/null || true
-          else
-            echo "⚠️ No existing deployment to backup"
+          # Check Docker
+          if ! command -v docker &> /dev/null; then
+            echo "❌ Docker is not installed!"
+            exit 1
           fi
           
-          echo "[3/8] 📥 Cloning/updating repository..."
-          if [ -d "$DEPLOY_DIR/.git" ]; then
-            cd "$DEPLOY_DIR"
-            git fetch origin
-            git reset --hard origin/$BRANCH
-            git clean -fdx
-            echo "✅ Repository updated from origin/$BRANCH"
+          if ! command -v docker-compose &> /dev/null && ! docker compose version &> /dev/null; then
+            echo "❌ Docker Compose is not installed!"
+            exit 1
+          fi
+          
+          echo "✅ Docker: $(docker --version)"
+          echo "✅ Docker Compose: $(docker compose version 2>/dev/null || docker-compose --version)"
+          
+          # Step 2: Create backup
+          echo ""
+          echo "💾 [2/7] CREATING BACKUP"
+          echo "----------------------------------------"
+          mkdir -p "$BACKUP_DIR"
+          
+          if [ -d "$APP_DIR" ]; then
+            BACKUP_PATH="$BACKUP_DIR/backup-$(date +%Y%m%d-%H%M%S)"
+            echo "Creating backup at: $BACKUP_PATH"
+            cp -r "$APP_DIR" "$BACKUP_PATH"
+            echo "✅ Backup created successfully"
+            
+            # Clean up old backups
+            echo "Cleaning up old backups (keeping last $MAX_BACKUPS)..."
+            (cd "$BACKUP_DIR" && ls -dt backup-* 2>/dev/null | tail -n +$(($MAX_BACKUPS + 1)) | xargs rm -rf 2>/dev/null || true)
           else
-            rm -rf "$DEPLOY_DIR"
-            git clone -b $BRANCH $REPO_URL "$DEPLOY_DIR"
+            echo "ℹ️  No existing application directory to backup"
+          fi
+          
+          # Step 3: Clone/update repository
+          echo ""
+          echo "📥 [3/7] UPDATING CODE"
+          echo "----------------------------------------"
+          mkdir -p "$APP_DIR"
+          
+          if [ -d "$APP_DIR/.git" ]; then
+            echo "Updating existing repository..."
+            cd "$APP_DIR"
+            git fetch --all
+            git checkout -f "$BRANCH"
+            git reset --hard "origin/$BRANCH"
+            git pull origin "$BRANCH"
+            git clean -fdx
+            echo "✅ Repository updated to latest $BRANCH"
+          else
+            echo "Cloning new repository..."
+            rm -rf "$APP_DIR"
+            git clone -b "$BRANCH" "$REPO_URL" "$APP_DIR"
             echo "✅ Repository cloned"
           fi
           
-          cd "$DEPLOY_DIR"
+          cd "$APP_DIR"
           
-          echo "[4/8] 📦 Setting up environment..."
+          # Step 4: Setup environment
+          echo ""
+          echo "⚙️  [4/7] SETTING UP ENVIRONMENT"
+          echo "----------------------------------------"
+          echo "Current directory: $(pwd)"
+          echo "Files in directory:"
+          ls -la
+          
+          # Create .env file if it doesn't exist
           if [ -f ".env.example" ] && [ ! -f ".env" ]; then
+            echo "Creating .env file from .env.example"
             cp .env.example .env
-            echo "✅ Created .env file from example"
           fi
           
-          # Update environment variables if needed
-          echo "ENVIRONMENT=$ENVIRONMENT" >> .env 2>/dev/null || true
-          echo "RELEASE_ID=$RELEASE_ID" >> .env 2>/dev/null || true
+          # Ensure .env file exists
+          if [ ! -f ".env" ]; then
+            echo "Creating default .env file"
+            touch .env
+          fi
           
-          echo "[5/8] 🐳 Building/Pulling Docker images..."
+          # Add deployment info to .env
+          {
+            echo ""
+            echo "# Deployment Information"
+            echo "ENVIRONMENT=$ENVIRONMENT"
+            echo "RELEASE_ID=$RELEASE_ID"
+            echo "DEPLOYED_AT=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            echo "GIT_BRANCH=$BRANCH"
+            echo "GIT_COMMIT=$COMMIT_SHA"
+          } >> .env
+          
+          echo "✅ Environment configured"
+          echo ".env file content (sensitive info redacted):"
+          grep -v -i "password\|secret\|key\|token" .env | head -20
+          
+          # Step 5: Build Docker images
+          echo ""
+          echo "🐳 [5/7] BUILDING DOCKER IMAGES"
+          echo "----------------------------------------"
+          
+          # Stop any running containers
+          echo "Stopping existing containers..."
+          docker compose down --remove-orphans --timeout 30 2>/dev/null || true
+          
+          # Build or pull images
           if [[ "$FORCE_REBUILD" == "true" ]]; then
-            echo "🔨 Force rebuilding images..."
-            docker compose build --no-cache
+            echo "🔨 Force rebuilding all images..."
+            docker compose build --no-cache --pull
           else
-            docker compose pull || docker compose build
+            echo "Pulling latest images..."
+            docker compose pull || {
+              echo "Pull failed, building images instead..."
+              docker compose build
+            }
           fi
           
-          echo "[6/8] 🛑 Stopping old containers..."
-          docker compose down --remove-orphans --timeout 30 || true
+          echo "✅ Docker images ready"
           
-          echo "[7/8] 🚀 Starting new containers..."
+          # Step 6: Start containers
+          echo ""
+          echo "🚀 [6/7] STARTING CONTAINERS"
+          echo "----------------------------------------"
+          echo "Starting Docker Compose services..."
           docker compose up -d
           
-          echo "[8/8] 🔍 Health checks..."
+          # Wait for containers to start
+          echo "Waiting for containers to become healthy..."
           sleep 10
           
-          # Check if containers are running
-          RUNNING_CONTAINERS=$(docker compose ps --services --filter "status=running" | wc -l)
-          TOTAL_CONTAINERS=$(docker compose ps --services | wc -l)
-          
-          echo "• Running containers: $RUNNING_CONTAINERS/$TOTAL_CONTAINERS"
+          # Check container status
+          echo "Container status:"
           docker compose ps
           
-          # Simple health check
-          echo "🧪 Performing health check..."
-          if [ $RUNNING_CONTAINERS -eq $TOTAL_CONTAINERS ]; then
-            echo "✅ All containers are running"
+          # Check if all services are running
+          RUNNING_COUNT=$(docker compose ps --services --filter "status=running" | wc -l)
+          TOTAL_COUNT=$(docker compose ps --services | wc -l)
+          
+          if [ "$RUNNING_COUNT" -eq "$TOTAL_COUNT" ]; then
+            echo "✅ All $TOTAL_COUNT containers are running"
           else
-            echo "⚠️ Some containers may not be running properly"
-            docker compose logs --tail=20
+            echo "⚠️  Only $RUNNING_COUNT out of $TOTAL_COUNT containers are running"
+            echo "Recent logs:"
+            docker compose logs --tail=10
           fi
           
-          echo "[9/9] 🧹 Cleaning up..."
-          docker system prune -f --filter "until=24h" || true
+          # Step 7: Verification and cleanup
+          echo ""
+          echo "🧹 [7/7] CLEANUP AND VERIFICATION"
+          echo "----------------------------------------"
           
-          echo "══════════════════════════════════════════════"
+          # Show recent logs
+          echo "Recent application logs:"
+          docker compose logs --tail=5 --timestamps
+          
+          # Clean up Docker resources
+          echo "Cleaning up unused Docker resources..."
+          docker system prune -f --filter "until=24h" 2>/dev/null || true
+          
+          echo ""
+          echo "══════════════════════════════════════════════════════"
           echo "✅ DEPLOYMENT COMPLETED SUCCESSFULLY"
-          echo "══════════════════════════════════════════════"
-          echo "• Release: $RELEASE_ID"
-          echo "• Log file: $LOG_FILE"
-          echo "• Backup: $BACKUP_DIR"
-          echo "• Deployed at: $(date)"
-          echo "══════════════════════════════════════════════"
-          EOF
-          )
+          echo "══════════════════════════════════════════════════════"
+          echo "• Application:     $(pwd)"
+          echo "• Environment:     $ENVIRONMENT"
+          echo "• Release ID:      $RELEASE_ID"
+          echo "• Containers:      $RUNNING_COUNT/$TOTAL_COUNT running"
+          echo "• Backup:          $BACKUP_PATH"
+          echo "• Log file:        $LOG_FILE"
+          echo "• Completed at:    $(date)"
+          echo "══════════════════════════════════════════════════════"
+          DEPLOY_SCRIPT
           
-          # Send command via SSM
+          # Make script executable
+          chmod +x /tmp/deploy.sh
+          
+          echo "✅ Deployment script prepared"
+
+      - name: Execute deployment via SSM
+        id: execute-deployment
+        run: |
+          echo "🚀 Sending deployment command via SSM..."
+          
+          # Read the deployment script and escape it properly
+          DEPLOY_SCRIPT_CONTENT=$(cat /tmp/deploy.sh)
+          
+          # Send the command
           COMMAND_ID=$(aws ssm send-command \
             --instance-ids "${{ secrets.EC2_INSTANCE_ID }}" \
             --document-name "AWS-RunShellScript" \
-            --parameters "commands=[$DEPLOY_SCRIPT],environment=[ENVIRONMENT=${{ needs.preflight-checks.outputs.environment }},RELEASE_ID=${{ needs.preflight-checks.outputs.release_id }},BRANCH=${{ github.ref_name }},COMMIT_SHA=${{ github.sha }},REPO_URL=https://github.com/${{ github.repository }},FORCE_REBUILD=${{ github.event.inputs.force_rebuild || false }}]" \
-            --comment "Deploy ${{ needs.preflight-checks.outputs.environment }} - ${{ needs.preflight-checks.outputs.release_id }}" \
+            --parameters "commands=[$DEPLOY_SCRIPT_CONTENT],workingDirectory=[/home/ubuntu],environment=[ENVIRONMENT=${{ needs.preflight-check.outputs.environment }},RELEASE_ID=${{ needs.preflight-check.outputs.release_id }},BRANCH=${{ github.ref_name }},COMMIT_SHA=${{ github.sha }},REPO_URL=https://github.com/${{ github.repository }}.git,FORCE_REBUILD=${{ github.event.inputs.force_rebuild || false }}]" \
+            --comment "Deploy ${{ needs.preflight-check.outputs.environment }} - ${{ needs.preflight-check.outputs.release_id }}" \
             --timeout-seconds 600 \
             --max-concurrency "1" \
             --max-errors "1" \
+            --cloud-watch-output-config 'CloudWatchOutputEnabled=true' \
             --query 'Command.CommandId' \
             --output text)
           
-          echo "Command ID: $COMMAND_ID"
+          if [ -z "$COMMAND_ID" ]; then
+            echo "❌ Failed to send SSM command"
+            exit 1
+          fi
+          
+          echo "SSM Command ID: $COMMAND_ID"
           echo "COMMAND_ID=$COMMAND_ID" >> $GITHUB_OUTPUT
 
-      - name: Wait for SSM command completion
-        if: needs.preflight-checks.outputs.deployment_mode == 'ssm'
+      - name: Monitor deployment progress
         run: |
-          echo "⏳ Waiting for SSM command to complete..."
+          echo "⏳ Monitoring deployment progress..."
+          echo "This may take a few minutes..."
           
-          for i in {1..120}; do
+          COMMAND_ID="${{ steps.execute-deployment.outputs.COMMAND_ID }}"
+          INSTANCE_ID="${{ secrets.EC2_INSTANCE_ID }}"
+          
+          # Wait for command to complete
+          for attempt in {1..120}; do
+            # Get command status
             STATUS=$(aws ssm get-command-invocation \
-              --command-id "${{ steps.deploy-ssm.outputs.COMMAND_ID }}" \
-              --instance-id "${{ secrets.EC2_INSTANCE_ID }}" \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$INSTANCE_ID" \
               --query 'Status' \
-              --output text 2>/dev/null || echo "Checking...")
+              --output text 2>/dev/null || echo "Pending")
             
-            echo "Status: $STATUS (attempt $i/120)"
+            echo "Attempt $attempt/120 - Status: $STATUS"
             
             case $STATUS in
               "Success")
                 echo ""
-                echo "✅ Deployment successful!"
+                echo "✅ DEPLOYMENT SUCCESSFUL!"
                 echo ""
-                echo "📋 Deployment output:"
+                
+                # Get the output
+                echo "📋 DEPLOYMENT OUTPUT:"
+                echo "══════════════════════════════════════════════════════"
                 aws ssm get-command-invocation \
-                  --command-id "${{ steps.deploy-ssm.outputs.COMMAND_ID }}" \
-                  --instance-id "${{ secrets.EC2_INSTANCE_ID }}" \
+                  --command-id "$COMMAND_ID" \
+                  --instance-id "$INSTANCE_ID" \
                   --query 'StandardOutputContent' \
                   --output text
+                echo "══════════════════════════════════════════════════════"
                 exit 0
                 ;;
+                
               "Failed" | "Cancelled" | "TimedOut")
                 echo ""
-                echo "❌ Deployment failed with status: $STATUS"
+                echo "❌ DEPLOYMENT FAILED: $STATUS"
                 echo ""
-                echo "🔍 Error details:"
-                aws ssm get-command-invocation \
-                  --command-id "${{ steps.deploy-ssm.outputs.COMMAND_ID }}" \
-                  --instance-id "${{ secrets.EC2_INSTANCE_ID }}" \
+                
+                # Get error details
+                echo "🔍 ERROR DETAILS:"
+                echo "══════════════════════════════════════════════════════"
+                ERROR_OUTPUT=$(aws ssm get-command-invocation \
+                  --command-id "$COMMAND_ID" \
+                  --instance-id "$INSTANCE_ID" \
                   --query 'StandardErrorContent' \
-                  --output text || true
+                  --output text 2>/dev/null || echo "No error output available")
+                
+                echo "$ERROR_OUTPUT"
+                echo ""
+                
+                # Also get standard output for context
+                echo "📄 STANDARD OUTPUT:"
+                STANDARD_OUTPUT=$(aws ssm get-command-invocation \
+                  --command-id "$COMMAND_ID" \
+                  --instance-id "$INSTANCE_ID" \
+                  --query 'StandardOutputContent' \
+                  --output text 2>/dev/null || echo "No standard output available")
+                
+                echo "$STANDARD_OUTPUT"
+                echo "══════════════════════════════════════════════════════"
                 exit 1
                 ;;
             esac
             
+            # Wait before checking again
             sleep 5
           done
           
-          echo "❌ Deployment timed out after 10 minutes"
-          
-          # Get command details for debugging
-          echo "📋 Command details:"
+          # If we get here, it timed out
+          echo ""
+          echo "❌ DEPLOYMENT TIMED OUT - No response after 10 minutes"
+          echo ""
+          echo "📋 Last known command status:"
           aws ssm list-commands \
-            --command-id "${{ steps.deploy-ssm.outputs.COMMAND_ID }}" \
-            --query 'Commands[0]' || true
+            --command-id "$COMMAND_ID" \
+            --query 'Commands[0]' \
+            --output table || true
           
           exit 1
 
-      - name: Deploy via SSH
-        id: deploy-ssh
-        if: needs.preflight-checks.outputs.deployment_mode == 'ssh'
-        uses: appleboy/ssh-action@v0.1.5
-        with:
-          host: ${{ secrets.EC2_HOST }}
-          username: ubuntu
-          key: ${{ secrets.EC2_SSH_KEY }}
-          command_timeout: 10m
-          script: |
-            set -e
-            
-            echo "══════════════════════════════════════════════"
-            echo "🚀 Starting SSH Deployment"
-            echo "══════════════════════════════════════════════"
-            
-            # Configuration
-            ENVIRONMENT="${{ needs.preflight-checks.outputs.environment }}"
-            RELEASE_ID="${{ needs.preflight-checks.outputs.release_id }}"
-            BRANCH="${{ github.ref_name }}"
-            COMMIT_SHA="${{ github.sha }}"
-            DEPLOY_DIR="/home/ubuntu/myapp"
-            RELEASES_DIR="/home/ubuntu/releases"
-            LOG_FILE="/home/ubuntu/deployments/$RELEASE_ID.log"
-            
-            # Create directories
-            mkdir -p "$RELEASES_DIR"
-            mkdir -p "/home/ubuntu/deployments"
-            
-            # Start logging
-            exec > >(tee -a "$LOG_FILE") 2>&1
-            
-            echo "[1/8] 📊 System check..."
-            df -h /home
-            free -h
-            docker --version
-            docker compose version
-            
-            echo "[2/8] 💾 Creating backup..."
-            if [ -d "$DEPLOY_DIR" ]; then
-              BACKUP_DIR="$RELEASES_DIR/myapp-$RELEASE_ID"
-              cp -r "$DEPLOY_DIR" "$BACKUP_DIR"
-              echo "✅ Backup created"
-              
-              # Clean old backups
-              ls -dt $RELEASES_DIR/myapp-* | tail -n +6 | xargs rm -rf 2>/dev/null || true
-            fi
-            
-            echo "[3/8] 📥 Cloning/updating repository..."
-            if [ -d "$DEPLOY_DIR/.git" ]; then
-              cd "$DEPLOY_DIR"
-              git fetch origin
-              git reset --hard origin/$BRANCH
-              git clean -fdx
-            else
-              rm -rf "$DEPLOY_DIR"
-              git clone -b $BRANCH https://github.com/${{ github.repository }}.git "$DEPLOY_DIR"
-            fi
-            
-            cd "$DEPLOY_DIR"
-            
-            echo "[4/8] 📦 Setting up environment..."
-            [ -f ".env.example" ] && [ ! -f ".env" ] && cp .env.example .env
-            echo "ENVIRONMENT=$ENVIRONMENT" >> .env 2>/dev/null || true
-            
-            echo "[5/8] 🐳 Building Docker images..."
-            docker compose build --no-cache
-            
-            echo "[6/8] 🛑 Stopping old containers..."
-            docker compose down --remove-orphans || true
-            
-            echo "[7/8] 🚀 Starting new containers..."
-            docker compose up -d
-            
-            echo "[8/8] 🔍 Health checks..."
-            sleep 10
-            docker compose ps
-            
-            echo "✅ Deployment completed via SSH"
-
-      - name: Verify deployment
+      - name: Verify deployment health
+        if: success()
         run: |
-          echo "🔍 Verifying deployment..."
+          echo "🔍 Performing post-deployment health check..."
           
-          # You can add health checks here, for example:
-          # curl -f http://your-app-url/health || true
+          # Add any health checks here
+          # Example: curl to check if application is responding
+          # curl -f http://your-app-url/health || echo "Health check warning"
           
-          echo "✅ Verification step completed"
+          echo "✅ Health check completed"
 
-  post-deploy:
-    needs: [preflight-checks, deploy]
-    runs-on: ubuntu-latest
+  post-deployment:
+    needs: [preflight-check, deploy]
     if: always()
+    runs-on: ubuntu-latest
     
     steps:
-      - name: Configure AWS credentials
-        if: needs.preflight-checks.outputs.deployment_mode == 'ssm'
-        uses: aws-actions/configure-aws-credentials@v2
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ secrets.AWS_REGION }}
-
-      - name: Deployment Summary
+      - name: Deployment summary
         run: |
           echo ""
           echo "══════════════════════════════════════════════════════"
           if [[ "${{ job.status }}" == "success" ]]; then
-            echo "🎉 DEPLOYMENT SUCCESSFUL"
+            echo "🎉 DEPLOYMENT SUMMARY - SUCCESS"
           else
-            echo "❌ DEPLOYMENT FAILED"
+            echo "📋 DEPLOYMENT SUMMARY - FAILED"
           fi
           echo "══════════════════════════════════════════════════════"
-          echo "Environment:    ${{ needs.preflight-checks.outputs.environment }}"
-          echo "Release ID:     ${{ needs.preflight-checks.outputs.release_id }}"
-          echo "Deployment Mode: ${{ needs.preflight-checks.outputs.deployment_mode }}"
-          echo "Branch:         ${{ github.ref_name }}"
-          echo "Commit:         ${{ github.sha }}"
-          echo "Triggered by:   ${{ github.actor }}"
-          echo "Trigger:        ${{ github.event_name }}"
-          echo "Timestamp:      $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+          echo "Repository:      ${{ github.repository }}"
+          echo "Environment:     ${{ needs.preflight-check.outputs.environment }}"
+          echo "Release ID:      ${{ needs.preflight-check.outputs.release_id }}"
+          echo "Branch:          ${{ github.ref_name }}"
+          echo "Commit:          ${{ github.sha }}"
+          echo "Triggered by:    ${{ github.actor }}"
+          echo "Trigger event:   ${{ github.event_name }}"
+          echo "Workflow run:    ${{ github.run_id }}"
+          echo "Deployment time: $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
           echo "══════════════════════════════════════════════════════"
           echo ""
           
           if [[ "${{ job.status }}" == "success" ]]; then
-            echo "📝 Rollback command:"
-            echo "   ssh ubuntu@<EC2_HOST> 'cd /home/ubuntu/releases && ls -lat myapp-*'"
+            echo "✅ Deployment completed successfully"
             echo ""
-            echo "🔄 Restart command:"
-            echo "   ssh ubuntu@<EC2_HOST> 'cd /home/ubuntu/myapp && docker compose restart'"
+            echo "📝 Rollback information:"
+            echo "   Backups are stored in: /home/ubuntu/app-backups/"
+            echo "   Latest log file: /home/ubuntu/deployment-logs/"
+            echo ""
+            echo "🔧 Common commands:"
+            echo "   View logs:       ssh ubuntu@ec2 'cd /home/ubuntu/myapp && docker compose logs'"
+            echo "   Restart:         ssh ubuntu@ec2 'cd /home/ubuntu/myapp && docker compose restart'"
+            echo "   Check status:    ssh ubuntu@ec2 'cd /home/ubuntu/myapp && docker compose ps'"
+          else
+            echo "❌ Deployment failed"
+            echo ""
+            echo "🔧 Troubleshooting steps:"
+            echo "1. Check SSM agent is running on EC2 instance"
+            echo "2. Verify IAM permissions for SSM"
+            echo "3. Check CloudWatch logs for SSM commands"
+            echo "4. SSH into instance and check /home/ubuntu/deployment-logs/"
           fi
 
       - name: Send notification on failure
@@ -477,18 +522,9 @@ jobs:
         uses: actions/github-script@v6
         with:
           script: |
-            const { repository, sha, ref } = context;
-            const commitUrl = `https://github.com/${repository}/commit/${sha}`;
-            
             github.rest.issues.createComment({
               issue_number: context.issue.number,
               owner: context.repo.owner,
               repo: context.repo.repo,
-              body: `❌ Deployment failed for ${ref}\n\nCommit: ${commitUrl}\n\nCheck the [workflow run](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}) for details.`
+              body: `## ❌ Deployment Failed\n\n**Environment:** ${{ needs.preflight-check.outputs.environment }}\n**Release:** ${{ needs.preflight-check.outputs.release_id }}\n**Branch:** ${{ github.ref_name }}\n**Commit:** ${context.sha.substring(0, 8)}\n\n[View workflow run](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})`
             });
-
-      - name: Cleanup on failure
-        if: failure()
-        run: |
-          echo "🧹 Cleaning up on failure..."
-          # Add any cleanup steps here
