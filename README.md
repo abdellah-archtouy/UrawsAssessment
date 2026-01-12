@@ -398,7 +398,7 @@ docker compose exec backend npx prisma migrate status
 # Check resource usage
 docker stats
 
-# Increase container resources in docker compose.yml
+# Increase container resources in docker-compose.yml
 # Add under each service:
 deploy:
   resources:
