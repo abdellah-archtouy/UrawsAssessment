@@ -1,4 +1,4 @@
-name: Deploy with Certbot Container
+name: Deploy with HTTPS (Nginx in Container)
 
 on:
   push:
@@ -9,21 +9,19 @@ jobs:
     runs-on: ubuntu-latest
     
     steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
     - name: Configure AWS
       uses: aws-actions/configure-aws-credentials@v4
       with:
         aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        aws-region: ${{ secrets.AWS_REGION }}
+        aws-region: ${{ secrets.AWS_REGION || 'us-east-1' }}
     
-    - name: Run Containerized Deployment
-      env:
-        INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID }}
-        DOMAIN: ${{ secrets.DOMAIN }}
-        EMAIL: ${{ secrets.EMAIL }}
+    - name: Create deployment script
       run: |
-        # Use single quotes and base64 to avoid escaping issues
-        DEPLOY_SCRIPT=$(cat << 'SCRIPT_EOF'
+        cat > /tmp/deploy.sh << 'SCRIPT_EOF'
         #!/bin/bash
         set -e
         
@@ -80,11 +78,11 @@ jobs:
           cp /home/ubuntu/app/nginx/nginx.conf /home/ubuntu/app/nginx/nginx.conf.backup
           
           # Create SSL nginx config
-          cat > /home/ubuntu/app/nginx/nginx.conf << 'NGINX_EOF'
+          cat > /home/ubuntu/app/nginx/nginx.conf << NGINX_EOF
         server {
             listen 80;
             server_name $DOMAIN www.$DOMAIN;
-            return 301 https://$server_name$request_uri;
+            return 301 https://\$server_name\$request_uri;
         }
         
         server {
@@ -97,20 +95,20 @@ jobs:
             # Your existing location blocks here
             location / {
                 proxy_pass http://frontend:3000;
-                proxy_set_header Host $host;
-                proxy_set_header X-Real-IP $remote_addr;
+                proxy_set_header Host \$host;
+                proxy_set_header X-Real-IP \$remote_addr;
             }
         
             location /api {
                 proxy_pass http://backend:5000;
-                proxy_set_header Host $host;
-                proxy_set_header X-Real-IP $remote_addr;
+                proxy_set_header Host \$host;
+                proxy_set_header X-Real-IP \$remote_addr;
             }
         }
         NGINX_EOF
         
           # Replace domain variable
-          sed -i "s/\$DOMAIN/$DOMAIN/g" /home/ubuntu/app/nginx/nginx.conf
+          sed -i "s/\\\$DOMAIN/$DOMAIN/g" /home/ubuntu/app/nginx/nginx.conf
         fi
         
         # Restart all containers
@@ -121,14 +119,50 @@ jobs:
         sleep 10
         curl -I https://$DOMAIN 2>/dev/null | head -1 || echo "HTTPS may not be ready yet"
         SCRIPT_EOF
-        )
         
-        # Send via SSM using AWS CLI
-        echo "$DEPLOY_SCRIPT" > /tmp/script.sh
+        # Make script executable
+        chmod +x /tmp/deploy.sh
+    
+    - name: Send deployment script via SSM
+      env:
+        INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID }}
+        DOMAIN: ${{ secrets.DOMAIN }}
+        EMAIL: ${{ secrets.EMAIL }}
+      run: |
+        # Read script and escape for JSON
+        SCRIPT_CONTENT=$(cat /tmp/deploy.sh)
         
-        # Use aws ssm send-command with file parameter
+        # Use jq to properly create JSON with escaped content
+        JSON_PAYLOAD=$(jq -n \
+          --arg domain "$DOMAIN" \
+          --arg email "$EMAIL" \
+          --arg script "$SCRIPT_CONTENT" \
+          '{
+            commands: [
+              "#!/bin/bash",
+              "set -e",
+              "export DOMAIN=\"" + $domain + "\"",
+              "export EMAIL=\"" + $email + "\"",
+              "cat > /tmp/deploy_exec.sh << \'EXEC_EOF\'",
+              $script,
+              "EXEC_EOF",
+              "chmod +x /tmp/deploy_exec.sh",
+              "/tmp/deploy_exec.sh"
+            ]
+          }')
+        
+        echo "$JSON_PAYLOAD" > /tmp/ssm_params.json
+        
+        # Send SSM command
         aws ssm send-command \
           --instance-ids "$INSTANCE_ID" \
           --document-name "AWS-RunShellScript" \
-          --parameters '{"commands": ["#!/bin/bash", "'"$(sed ':a;N;$!ba;s/\n/", "/g' /tmp/script.sh)"'"]}' \
-          --timeout-seconds 600
+          --parameters file:///tmp/ssm_params.json \
+          --comment "HTTPS deployment for containerized Nginx" \
+          --timeout-seconds 900 \
+          --output text
+        
+        echo "✅ Deployment command sent successfully"
+        
+        # Cleanup
+        rm -f /tmp/deploy.sh /tmp/ssm_params.json
