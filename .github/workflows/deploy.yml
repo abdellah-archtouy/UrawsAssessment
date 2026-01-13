@@ -1,4 +1,4 @@
-name: Auto Deploy (main code + release deploy)
+name: Production Deploy
 
 on:
   push:
@@ -23,19 +23,23 @@ jobs:
             --document-name "AWS-RunShellScript" \
             --parameters 'commands=[
               "set -e",
+
+              "# 1️⃣ Bootstrap repo (once)",
               "cd /home/ubuntu",
-              "if [ ! -d app ]; then git clone https://github.com/abdellah-archtouy/UrawsAssessment.git app; fi",
-              "cd app",
+              "if [ ! -d repo ]; then git clone https://github.com/abdellah-archtouy/UrawsAssessment.git repo; fi",
+              "cd repo",
               "git fetch origin",
-              
-              "# Checkout main for app code",
+
+              "# 2️⃣ Sync deploy logic from release",
+              "git checkout release -- deploy",
+              "rm -rf /home/ubuntu/deploy",
+              "mv deploy /home/ubuntu/deploy",
+              "chmod +x /home/ubuntu/deploy/deploy.sh",
+
+              "# 3️⃣ Sync app code from main",
               "git checkout main",
               "git pull origin main",
-              
-              "# Extract deploy script from release",
-              "git checkout release -- deploy",
-              "chmod +x deploy/deploy.sh",
-              
-              "./deploy/deploy.sh"
-            ]' \
-            --comment "Deploy main with release deploy script"
+
+              "# 4️⃣ Run deploy",
+              "/home/ubuntu/deploy/deploy.sh"
+            ]'
