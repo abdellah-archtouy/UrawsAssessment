@@ -2,33 +2,56 @@
 set -e
 
 echo "🚀 Starting deployment"
-echo "======================"
 
-# Variables
-DOMAIN="${DOMAIN:-aarchtou.me}"
-EMAIL="${EMAIL:-admin@aarchtou.me}"
-DB_PASSWORD="${DB_PASSWORD:-rootpassword}"
+APP_DIR="/home/ubuntu/app"
+DOMAIN="aarchtou.me"
+EMAIL="admin@aarchtou.me"
 
-cd /home/ubuntu/app
+CERT_PATH="/etc/letsencrypt/live/${DOMAIN}/fullchain.pem"
 
-echo "📦 Pulling latest code..."
-git pull origin release
+cd "$APP_DIR"
 
-echo "🔧 Setting up environment..."
+echo "🐳 Stopping old containers"
+docker compose down  || true
 
-# Create .env file for backend
-cat > .env << EOF
-DATABASE_URL=mysql://root:${DB_PASSWORD}@mysql:3306/userdb
-PORT=5000
-NODE_ENV=production
-CORS_ORIGIN=*
-EOF
+echo "🐳 Building and starting containers"
+docker compose up -d --build mysql backend frontend nginx
 
-echo "🐳 Starting containers..."
-docker-compose down 2>/dev/null || true
-docker-compose up -d --build
+echo "⏳ Waiting for backend to be ready"
+sleep 10
 
-echo "⏳ Waiting for services to start..."
-sleep 30
+# ==============================
+# Prisma migration (SAFE)
+# ==============================
+echo "🛠️ Running Prisma migrations"
 
-echo "✅ Deployment step completed"
+docker compose exec backend npx prisma migrate deploy \
+  || docker compose exec backend npx prisma db push
+
+echo "✅ Prisma migration done"
+
+# ==============================
+# SSL certificate (ONLY if missing)
+# ==============================
+if [ ! -f "$CERT_PATH" ]; then
+  echo "🔐 SSL certificate not found — generating..."
+
+  docker compose stop nginx || true
+
+  docker compose run --rm certbot certonly \
+    --webroot \
+    --webroot-path /var/www/certbot \
+    -d "$DOMAIN" -d "www.$DOMAIN" \
+    --email "$EMAIL" \
+    --agree-tos \
+    --non-interactive
+
+  echo "✅ SSL certificate generated"
+else
+  echo "🔒 SSL certificate already exists — skipping"
+fi
+
+echo "🔄 Restarting nginx"
+docker compose restart nginx
+
+echo "✅ Deployment completed successfully"
