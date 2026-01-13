@@ -1,43 +1,74 @@
 #!/bin/bash
 set -e
 
-echo "🚀 DEPLOYMENT EXECUTION"
+echo "🚀 Deploying application"
 echo "======================="
-echo "Image Tag: $1"
-echo "Starting at: $(date)"
-echo ""
 
-cd /opt/uraws
+# Go to app directory
+cd /home/ubuntu/app
 
-echo "1. Updating image tags in docker-compose.yml..."
-sed -i "s|aarchtou/youraws-backend:latest|aarchtou/youraws-backend:$1|g" docker-compose.yml
-sed -i "s|aarchtou/youraws-frontend:latest|aarchtou/youraws-frontend:$1|g" docker-compose.yml
+# Update docker-compose.yml if needed for SSL
+echo "🔧 Configuring Docker Compose for SSL..."
+if [ -f "docker-compose.yml" ]; then
+    # Check if SSL volume mount exists
+    if ! grep -q "nginx/ssl" docker-compose.yml; then
+        echo "➕ Adding SSL volume mount..."
+        
+        # Create backup
+        cp docker-compose.yml docker-compose.yml.backup
+        
+        # Update nginx service to include SSL volume
+        cat > docker-compose.yml << 'DOCKER_COMPOSE'
+version: '3.8'
 
-echo "2. Pulling new images from Docker Hub..."
-docker compose pull || {
-  echo "❌ Failed to pull images"
-  echo "Trying to build locally..."
-  exit 1
-}
+services:
+  nginx:
+    image: nginx:alpine
+    container_name: nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+    depends_on:
+      - frontend
+      - backend
+    restart: unless-stopped
 
-echo "3. Stopping existing containers..."
-docker compose down || true
+  frontend:
+    build: ./frontend
+    container_name: frontend
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
 
-echo "4. Starting new containers..."
-docker compose up -d || {
-  echo "❌ Failed to start containers"
-  exit 1
-}
+  backend:
+    build: ./backend
+    container_name: backend
+    ports:
+      - "5000:5000"
+    environment:
+      - DB_HOST=database
 
-echo "5. Waiting for services to start..."
-sleep 20
+  database:
+    image: postgres:14
+    container_name: database
+    environment:
+      - POSTGRES_PASSWORD=yourpassword
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
 
-echo "6. Checking container status..."
-docker compose ps
+volumes:
+  postgres_data:
+DOCKER_COMPOSE
+    fi
+fi
 
-echo "7. Cleaning up old images..."
-docker image prune -af 2>/dev/null || true
+# Deploy with Docker Compose
+echo "🐳 Starting containers..."
+docker compose down 2>/dev/null || true
+docker compose up -d --build
 
-echo ""
-echo "✅ DEPLOYMENT COMPLETED"
-echo "Completed at: $(date)"
+echo "✅ Application deployed successfully"

@@ -1,4 +1,4 @@
-name: Deploy Application with SSL
+name: Deploy Application
 
 on:
   push:
@@ -9,6 +9,9 @@ jobs:
     runs-on: ubuntu-latest
     
     steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
     - name: Configure AWS Credentials
       uses: aws-actions/configure-aws-credentials@v4
       with:
@@ -16,23 +19,112 @@ jobs:
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         aws-region: ${{ secrets.AWS_REGION || 'us-east-1' }}
     
-    - name: Deploy via SSM
+    - name: Upload and Run Deployment Scripts
       env:
         INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID }}
         DOMAIN: ${{ secrets.DOMAIN }}
         EMAIL: ${{ secrets.EMAIL }}
       run: |
-        # Create a JSON file with deployment commands
-        cat > /tmp/ssm_commands.json << 'EOF'
+        # Create a simple deployment command
+        DEPLOY_COMMAND=$(cat << 'EOF'
+        #!/bin/bash
+        set -e
+        
+        echo "🚀 Starting automated deployment"
+        echo "================================"
+        
+        # Variables
+        DOMAIN="$1"
+        EMAIL="$2"
+        
+        # Go to home directory
+        cd /home/ubuntu
+        
+        # Step 1: Update or clone repository
+        echo "📦 Step 1: Getting latest code..."
+        if [ -d "app/.git" ]; then
+          cd app
+          git fetch origin
+          git checkout release
+          git pull origin release
+        else
+          git clone -b release https://github.com/abdellah-archtouy/UrawsAssessment.git app
+          cd app
+        fi
+        
+        # Step 2: Run pre-deployment checks
+        echo "🔍 Step 2: Running pre-deployment checks..."
+        
+        # Make sure we have the deploy directory
+        if [ -d "deploy" ]; then
+          echo "✅ Found deploy scripts"
+          chmod +x deploy/*.sh 2>/dev/null || true
+        else
+          echo "❌ No deploy directory found"
+          exit 1
+        fi
+        
+        # Step 3: Run pre-deploy script (if exists)
+        if [ -f "deploy/pre_deploy.sh" ]; then
+          echo "🔧 Step 3: Running pre-deployment setup..."
+          chmod +x deploy/pre_deploy.sh
+          DOMAIN="$DOMAIN" EMAIL="$EMAIL" ./deploy/pre_deploy.sh
+        fi
+        
+        # Step 4: Run main deployment
+        echo "🐳 Step 4: Deploying application..."
+        if [ -f "deploy/deploy.sh" ]; then
+          chmod +x deploy/deploy.sh
+          DOMAIN="$DOMAIN" EMAIL="$EMAIL" ./deploy/deploy.sh
+        else
+          # Fallback to docker compose
+          docker compose down 2>/dev/null || true
+          docker compose up -d --build
+        fi
+        
+        # Wait for services
+        echo "⏳ Waiting for services to start..."
+        sleep 30
+        
+        # Step 5: Run post-deploy script (if exists)
+        if [ -f "deploy/post_deploy.sh" ]; then
+          echo "✅ Step 5: Running post-deployment verification..."
+          chmod +x deploy/post_deploy.sh
+          DOMAIN="$DOMAIN" EMAIL="$EMAIL" ./deploy/post_deploy.sh
+        else
+          # Basic verification
+          echo "📊 Container status:"
+          docker compose ps
+          
+          echo "🔍 Testing HTTP:"
+          curl -s -o /dev/null -w "HTTP: %{http_code}\n" http://localhost || echo "HTTP test failed"
+          
+          echo "🔒 Testing HTTPS:"
+          curl -s -o /dev/null -w "HTTPS: %{http_code}\n" https://localhost 2>/dev/null || echo "HTTPS not configured"
+        fi
+        
+        echo ""
+        echo "🎉 Deployment completed successfully!"
+        echo "🌐 Application should be accessible at: https://$DOMAIN"
+        EOF
+        )
+        
+        # Create the SSM command that runs our script
+        cat > /tmp/ssm_command.json << 'EOF'
         {
           "commands": [
             "#!/bin/bash",
             "set -e",
             "",
-            "echo '🚀 Starting deployment'",
+            "# Create deployment script",
+            "cat > /tmp/deploy_main.sh << 'SCRIPT_END'",
+            "#!/bin/bash",
+            "set -e",
+            "DOMAIN=\"$DOMAIN\"",
+            "EMAIL=\"$EMAIL\"",
             "cd /home/ubuntu",
             "",
-            "# Update or clone the code",
+            "# Update or clone repository",
             "if [ -d \"app/.git\" ]; then",
             "  cd app",
             "  git fetch origin",
@@ -43,225 +135,38 @@ jobs:
             "  cd app",
             "fi",
             "",
-            "# Stop existing containers",
-            "echo '⏹️ Stopping existing containers...'",
-            "docker compose down 2>/dev/null || true",
-            "",
-            "# Deploy with Docker Compose",
-            "echo '🐳 Building and starting containers...'",
-            "docker compose up -d --build",
-            "",
-            "# Wait for services to be ready",
-            "echo '⏳ Waiting for services...'",
-            "sleep 30",
-            "",
-            "# Setup HTTPS for containerized Nginx",
-            "echo '🔐 Setting up SSL for containerized Nginx...'",
-            "",
-            "# Check if certbot is installed on host",
-            "if command -v certbot >/dev/null 2>&1; then",
-            "  echo '✅ Certbot found on host'",
-            "  ",
-            "  # Get SSL certificate using standalone method",
-            "  echo '📜 Getting SSL certificate...'",
-            "  certbot certonly --standalone \\",
-            "    -d \"$DOMAIN\" \\",
-            "    -d \"www.$DOMAIN\" \\",
-            "    --non-interactive \\",
-            "    --agree-tos \\",
-            "    --email \"$EMAIL\" \\",
-            "    --http-01-port=8080 \\",
-            "    --keep-until-expiring || echo '⚠️ Certificate may already exist or failed'",
-            "  ",
-            "  # Create directory for certificates",
-            "  echo '📁 Setting up certificate directory...'",
-            "  mkdir -p /home/ubuntu/app/nginx/ssl",
-            "  ",
-            "  # Copy certificates to app directory",
-            "  echo '📋 Copying certificates...'",
-            "  cp -L /etc/letsencrypt/live/$DOMAIN/fullchain.pem /home/ubuntu/app/nginx/ssl/ 2>/dev/null || echo '⚠️ Could not copy fullchain.pem'",
-            "  cp -L /etc/letsencrypt/live/$DOMAIN/privkey.pem /home/ubuntu/app/nginx/ssl/ 2>/dev/null || echo '⚠️ Could not copy privkey.pem'",
-            "  ",
-            "  # Set proper permissions",
-            "  chmod 644 /home/ubuntu/app/nginx/ssl/fullchain.pem 2>/dev/null || true",
-            "  chmod 600 /home/ubuntu/app/nginx/ssl/privkey.pem 2>/dev/null || true",
-            "  ",
-            "  # Update Nginx configuration for SSL",
-            "  echo '🔧 Configuring Nginx for HTTPS...'",
-            "  ",
-            "  # Check if nginx directory exists",
-            "  if [ -d \"/home/ubuntu/app/nginx\" ]; then",
-            "    # Create HTTPS nginx config",
-            "    cat > /home/ubuntu/app/nginx/nginx.conf << 'NGINX_EOF'",
-            "events {",
-            "    worker_connections 1024;",
-            "}",
-            "",
-            "http {",
-            "    # HTTP to HTTPS redirect",
-            "    server {",
-            "        listen 80;",
-            "        server_name $DOMAIN www.$DOMAIN;",
-            "        return 301 https://\\$server_name\\$request_uri;",
-            "    }",
-            "",
-            "    # HTTPS server",
-            "    server {",
-            "        listen 443 ssl http2;",
-            "        server_name $DOMAIN www.$DOMAIN;",
-            "",
-            "        # SSL certificates",
-            "        ssl_certificate /etc/nginx/ssl/fullchain.pem;",
-            "        ssl_certificate_key /etc/nginx/ssl/privkey.pem;",
-            "        ",
-            "        # SSL settings",
-            "        ssl_protocols TLSv1.2 TLSv1.3;",
-            "        ssl_ciphers ECDHE-RSA-AES256-GCM-SHA512:DHE-RSA-AES256-GCM-SHA512:ECDHE-RSA-AES256-GCM-SHA384:DHE-RSA-AES256-GCM-SHA384;",
-            "        ssl_prefer_server_ciphers off;",
-            "        ",
-            "        # Security headers",
-            "        add_header X-Frame-Options DENY;",
-            "        add_header X-Content-Type-Options nosniff;",
-            "        add_header X-XSS-Protection \"1; mode=block\";",
-            "",
-            "        # Frontend",
-            "        location / {",
-            "            proxy_pass http://frontend:3000;",
-            "            proxy_set_header Host \\$host;",
-            "            proxy_set_header X-Real-IP \\$remote_addr;",
-            "            proxy_set_header X-Forwarded-For \\$proxy_add_x_forwarded_for;",
-            "            proxy_set_header X-Forwarded-Proto \\$scheme;",
-            "        }",
-            "",
-            "        # Backend API",
-            "        location /api {",
-            "            proxy_pass http://backend:5000;",
-            "            proxy_set_header Host \\$host;",
-            "            proxy_set_header X-Real-IP \\$remote_addr;",
-            "            proxy_set_header X-Forwarded-For \\$proxy_add_x_forwarded_for;",
-            "            proxy_set_header X-Forwarded-Proto \\$scheme;",
-            "        }",
-            "",
-            "        # Health check",
-            "        location /health {",
-            "            return 200 'OK';",
-            "            add_header Content-Type text/plain;",
-            "        }",
-            "    }",
-            "}",
-            "NGINX_EOF",
-            "  else",
-            "    echo '⚠️ Nginx directory not found'",
-            "  fi",
-            "  ",
-            "  # Update docker-compose.yml to mount certificates",
-            "  echo '🐳 Updating Docker Compose configuration...'",
-            "  if [ -f \"docker-compose.yml\" ]; then",
-            "    # Check if volume mount exists",
-            "    if ! grep -q \"certificates\" docker-compose.yml; then",
-            "      echo '➕ Adding certificate volume mount...'",
-            "      ",
-            "      # Create backup",
-            "      cp docker-compose.yml docker-compose.yml.backup",
-            "      ",
-            "      # Read and modify the file
-            "      cat > docker-compose.yml << 'DOCKER_EOF'",
-            "version: '3.8'",
-            "",
-            "services:",
-            "  nginx:",
-            "    image: nginx:alpine",
-            "    container_name: nginx",
-            "    ports:",
-            "      - \"80:80\"",
-            "      - \"443:443\"",
-            "    volumes:",
-            "      - ./nginx/nginx.conf:/etc/nginx/nginx.conf",
-            "      - ./nginx/ssl:/etc/nginx/ssl:ro",
-            "    depends_on:",
-            "      - frontend",
-            "      - backend",
-            "    restart: unless-stopped",
-            "",
-            "  frontend:",
-            "    build: ./frontend",
-            "    container_name: frontend",
-            "",
-            "  backend:",
-            "    build: ./backend",
-            "    container_name: backend",
-            "",
-            "  database:",
-            "    image: postgres:14",
-            "    container_name: database",
-            "    environment:",
-            "      POSTGRES_PASSWORD: yourpassword",
-            "    volumes:",
-            "      - postgres_data:/var/lib/postgresql/data",
-            "",
-            "volumes:",
-            "  postgres_data:",
-            "DOCKER_EOF",
-            "    else",
-            "      echo '✅ Certificate volume mount already exists'",
-            "    fi",
-            "  else",
-            "    echo '❌ docker-compose.yml not found!'",
-            "  fi",
-            "  ",
-            "  # Restart containers with SSL configuration",
-            "  echo '🔄 Restarting containers with SSL...'",
-            "  docker compose down",
-            "  docker compose up -d",
-            "  ",
+            "# Run deployment scripts",
+            "if [ -d \"deploy\" ]; then",
+            "  chmod +x deploy/*.sh 2>/dev/null || true",
+            "  [ -f \"deploy/pre_deploy.sh\" ] && DOMAIN=\"$DOMAIN\" EMAIL=\"$EMAIL\" ./deploy/pre_deploy.sh",
+            "  [ -f \"deploy/deploy.sh\" ] && DOMAIN=\"$DOMAIN\" EMAIL=\"$EMAIL\" ./deploy/deploy.sh || docker compose up -d --build",
+            "  sleep 30",
+            "  [ -f \"deploy/post_deploy.sh\" ] && DOMAIN=\"$DOMAIN\" EMAIL=\"$EMAIL\" ./deploy/post_deploy.sh",
             "else",
-            "  echo '⚠️ Certbot not found on host, skipping SSL setup'",
-            "  echo '💡 Please install certbot manually: sudo apt install certbot python3-certbot-nginx'",
+            "  echo \"No deploy directory found\"",
+            "  docker compose up -d --build",
             "fi",
             "",
-            "# Wait for SSL to be ready",
-            "echo '⏳ Waiting for HTTPS to be ready...'",
-            "sleep 20",
-            "",
-            "# Verify deployment",
-            "echo '✅ Deployment complete!'",
-            "echo '📊 Container status:'",
+            "# Final check",
+            "echo \"Deployment completed!\"",
             "docker compose ps",
+            "SCRIPT_END",
             "",
-            "# Test connections",
-            "echo '🔍 Testing endpoints...'",
-            "echo 'Testing HTTP (should redirect):'",
-            "curl -s -o /dev/null -w 'HTTP: %{http_code}\\n' http://localhost || echo 'HTTP test failed'",
-            "echo 'Testing HTTPS:'",
-            "curl -s -o /dev/null -w 'HTTPS: %{http_code}\\n' https://localhost 2>/dev/null || echo 'HTTPS test failed (SSL may not be configured)'",
-            "",
-            "# Check if SSL certificates exist",
-            "echo '🔒 SSL certificate status:'",
-            "if [ -f \"/home/ubuntu/app/nginx/ssl/fullchain.pem\" ]; then",
-            "  echo '✅ SSL certificates found in app directory'",
-            "  ls -la /home/ubuntu/app/nginx/ssl/",
-            "else",
-            "  echo '⚠️ SSL certificates not found in app directory'",
-            "fi"
+            "# Make it executable and run",
+            "chmod +x /tmp/deploy_main.sh",
+            "/tmp/deploy_main.sh"
           ]
         }
         EOF
         
-        # Replace environment variables in the JSON file
-        sed -i "s/\$DOMAIN/$DOMAIN/g" /tmp/ssm_commands.json
-        sed -i "s/\$EMAIL/$EMAIL/g" /tmp/ssm_commands.json
-        
+        # Send the SSM command
         echo "📤 Sending deployment command to EC2 instance: $INSTANCE_ID"
         
-        # Send SSM command
         aws ssm send-command \
           --instance-ids "$INSTANCE_ID" \
           --document-name "AWS-RunShellScript" \
-          --parameters file:///tmp/ssm_commands.json \
-          --comment "Deployment with SSL for containerized Nginx" \
+          --parameters file:///tmp/ssm_command.json \
+          --comment "GitHub Actions Deployment" \
           --timeout-seconds 600
         
         echo "✅ Deployment command sent successfully"
-        
-        # Cleanup
-        rm -f /tmp/ssm_commands.json
