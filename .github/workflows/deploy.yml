@@ -1,4 +1,4 @@
-name: Full Deploy Application
+name: Deploy Application with HTTPS
 
 on:
   push:
@@ -7,131 +7,223 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    
+
     steps:
       - name: Checkout release branch
         uses: actions/checkout@v4
         with:
           ref: release
 
-      - name: Configure AWS Credentials
+      - name: Configure AWS
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION || 'us-east-1' }}
 
-      - name: Deploy to EC2 via SSM
+      - name: Deploy via SSM
         env:
           INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID }}
           DOMAIN: ${{ secrets.DOMAIN || 'aarchtou.me' }}
           EMAIL: ${{ secrets.EMAIL || 'admin@aarchtou.me' }}
           DB_PASSWORD: ${{ secrets.DB_PASSWORD || 'rootpassword' }}
-          MAIN_BRANCH: "main"
         run: |
-          echo "📤 Sending deployment command to EC2..."
+          echo "🚀 Starting deployment on EC2..."
+          echo "EC2 Instance: $INSTANCE_ID"
+          echo "Domain: $DOMAIN"
+          echo "Email: $EMAIL"
 
-          DEPLOY_SCRIPT=$(cat << 'EOF'
-          #!/bin/bash
-          set -e
+          DEPLOY_SCRIPT=$(            #!/bin/bash
+            set -e
 
-          DOMAIN="$1"
-          EMAIL="$2"
-          DB_PASSWORD="$3"
-          MAIN_BRANCH="$4"
+            # Variables
+            DOMAIN="$1"
+            EMAIL="$2"
+            DB_PASSWORD="$3"
 
-          cd /home/ubuntu
+            cd /home/ubuntu
 
-          echo "🚀 Pulling latest code from main branch..."
-          if [ -d "app/.git" ]; then
-              cd app
-              git fetch origin
-              git checkout $MAIN_BRANCH
-              git pull origin $MAIN_BRANCH
-          else
-              git clone -b $MAIN_BRANCH https://github.com/abdellah-archtouy/UrawsAssessment.git app
-              cd app
-          fi
+            echo "📦 STEP 1: CLONE OR UPDATE MAIN BRANCH"
+            if [ -d "app/.git" ]; then
+            cd app
+            git fetch origin
+            git checkout main
+            git pull origin main
+            else
+            git clone -b main https://github.com/abdellah-archtouy/UrawsAssessment.git app
+            cd app
+            fi
 
-          echo "✅ Code is up to date"
+            echo "✅ Code updated from main branch"
 
-          # Create directories
-          mkdir -p ./certificates ./certbot/www ./nginx
+            # Step 2: Setup environment
+            echo "⚙️ STEP 2: SETTING UP ENVIRONMENT"
+            cat > .env << ENV
+            DATABASE_URL=mysql://root:${DB_PASSWORD}@mysql:3306/userdb
+            PORT=5000
+            NODE_ENV=production
+            CORS_ORIGIN=*
+            ENV
+            echo "✅ Environment file created"
 
-          # Create .env
-          cat > .env << ENV_EOF
-          DATABASE_URL=mysql://root:${DB_PASSWORD}@mysql:3306/userdb
-          PORT=5000
-          NODE_ENV=production
-          CORS_ORIGIN=*
-          ENV_EOF
-          echo "✅ Environment file created"
+            # Step 3: Install certbot if not present
+            if ! command -v certbot >/dev/null 2>&1; then
+            echo "Installing Certbot..."
+            sudo apt update
+            sudo apt install -y certbot python3-certbot-nginx
+            fi
 
-          # Install certbot if missing
-          if ! command -v certbot >/dev/null 2>&1; then
-              sudo apt update
-              sudo apt install -y certbot python3-certbot-nginx
-              echo "✅ Certbot installed"
-          fi
+            # Step 4: Create directories
+            mkdir -p ./certificates ./certbot/www ./nginx
 
-          # Stop previous containers
-          echo "🐳 Stopping previous containers..."
-          docker compose down || true
+            # Step 5: Stop previous containers and start fresh
+            echo "🐳 STEP 5: STARTING DOCKER CONTAINERS"
+            docker compose down -v || true
+            docker compose up -d --build
 
-          # Obtain SSL certificate
-          echo "🔐 Requesting SSL certificate for $DOMAIN..."
-          if sudo certbot certonly --standalone -d "$DOMAIN" -d "www.$DOMAIN" --non-interactive --agree-tos --email "$EMAIL" --force-renewal; then
-              echo "✅ SSL certificate obtained"
-              sudo cp -L /etc/letsencrypt/live/$DOMAIN/fullchain.pem ./certificates/
-              sudo cp -L /etc/letsencrypt/live/$DOMAIN/privkey.pem ./certificates/
-              sudo chmod 644 ./certificates/fullchain.pem
-              sudo chmod 600 ./certificates/privkey.pem
-          else
-              echo "⚠️ Could not obtain SSL certificate"
-          fi
+            echo "⏳ Waiting 10s for containers to start..."
+            sleep 10
 
-          # Start Docker Compose containers
-          echo "🐳 Starting Docker Compose containers..."
-          docker compose up -d --build
+            # Step 6: Run Prisma migrations in backend
+            echo "🛠️ STEP 6: RUNNING PRISMA MIGRATIONS"
+            docker compose exec backend npx prisma migrate deploy || \
+            docker compose exec backend npx prisma db push --accept-data-loss || \
+            docker compose exec backend npm run migrate || \
+            echo "⚠️ Prisma migrations failed"
+            echo "✅ Prisma migrations attempted"
 
-          # Verify container status
-          echo "📊 Container status:"
-          docker compose ps
+            # Step 7: Setup SSL certificates with Certbot
+            echo "🔐 STEP 7: SETTING UP SSL CERTIFICATES"
+            docker stop nginx 2>/dev/null || true
+            if sudo certbot certonly --standalone \
+            -d "$DOMAIN" -d "www.$DOMAIN" \
+            --non-interactive --agree-tos \
+            --email "$EMAIL" --force-renewal; then
+                echo "✅ SSL certificate obtained"
+                sudo cp -L /etc/letsencrypt/live/$DOMAIN/fullchain.pem ./certificates/ 2>/dev/null || true
+                sudo cp -L /etc/letsencrypt/live/$DOMAIN/privkey.pem ./certificates/ 2>/dev/null || true
+                sudo chmod 644 ./certificates/fullchain.pem
+                sudo chmod 600 ./certificates/privkey.pem
+            else
+                echo "⚠️ SSL certificate failed, continuing in HTTP mode"
+            fi
 
-          # Test endpoints
-          echo "🌐 Testing endpoints..."
-          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://$DOMAIN || echo "failed")
-          HTTPS_STATUS=$(curl -s -k -o /dev/null -w "%{http_code}" https://$DOMAIN || echo "failed")
-          echo "HTTP Status: $HTTP_STATUS"
-          echo "HTTPS Status: $HTTPS_STATUS"
+            # Step 8: Reload Nginx
+            docker compose exec nginx nginx -t 2>/dev/null || true
+            docker compose exec nginx nginx -s reload 2>/dev/null || true
 
-          echo "✅ Deployment finished successfully"
-          EOF
-          )
+            echo "✅ DEPLOYMENT COMPLETE"
+            EOF
+                    )cat << 'EOF'
+            #!/bin/bash
+            set -e
 
+            # Variables
+            DOMAIN="$1"
+            EMAIL="$2"
+            DB_PASSWORD="$3"
+
+            cd /home/ubuntu
+
+            echo "📦 STEP 1: CLONE OR UPDATE MAIN BRANCH"
+            if [ -d "app/.git" ]; then
+            cd app
+            git fetch origin
+            git checkout main
+            git pull origin main
+            else
+            git clone -b main https://github.com/abdellah-archtouy/UrawsAssessment.git app
+            cd app
+            fi
+
+            echo "✅ Code updated from main branch"
+
+            # Step 2: Setup environment
+            echo "⚙️ STEP 2: SETTING UP ENVIRONMENT"
+            cat > .env << ENV
+            DATABASE_URL=mysql://root:${DB_PASSWORD}@mysql:3306/userdb
+            PORT=5000
+            NODE_ENV=production
+            CORS_ORIGIN=*
+            ENV
+            echo "✅ Environment file created"
+
+            # Step 3: Install certbot if not present
+            if ! command -v certbot >/dev/null 2>&1; then
+            echo "Installing Certbot..."
+            sudo apt update
+            sudo apt install -y certbot python3-certbot-nginx
+            fi
+
+            # Step 4: Create directories
+            mkdir -p ./certificates ./certbot/www ./nginx
+
+            # Step 5: Stop previous containers and start fresh
+            echo "🐳 STEP 5: STARTING DOCKER CONTAINERS"
+            docker compose down -v || true
+            docker compose up -d --build
+
+            echo "⏳ Waiting 10s for containers to start..."
+            sleep 10
+
+            # Step 6: Run Prisma migrations in backend
+            echo "🛠️ STEP 6: RUNNING PRISMA MIGRATIONS"
+            docker compose exec backend npx prisma migrate deploy || \
+            docker compose exec backend npx prisma db push --accept-data-loss || \
+            docker compose exec backend npm run migrate || \
+            echo "⚠️ Prisma migrations failed"
+            echo "✅ Prisma migrations attempted"
+
+            # Step 7: Setup SSL certificates with Certbot
+            echo "🔐 STEP 7: SETTING UP SSL CERTIFICATES"
+            docker stop nginx 2>/dev/null || true
+            if sudo certbot certonly --standalone \
+            -d "$DOMAIN" -d "www.$DOMAIN" \
+            --non-interactive --agree-tos \
+            --email "$EMAIL" --force-renewal; then
+                echo "✅ SSL certificate obtained"
+                sudo cp -L /etc/letsencrypt/live/$DOMAIN/fullchain.pem ./certificates/ 2>/dev/null || true
+                sudo cp -L /etc/letsencrypt/live/$DOMAIN/privkey.pem ./certificates/ 2>/dev/null || true
+                sudo chmod 644 ./certificates/fullchain.pem
+                sudo chmod 600 ./certificates/privkey.pem
+            else
+                echo "⚠️ SSL certificate failed, continuing in HTTP mode"
+            fi
+
+            # Step 8: Reload Nginx
+            docker compose exec nginx nginx -t 2>/dev/null || true
+            docker compose exec nginx nginx -s reload 2>/dev/null || true
+
+            echo "✅ DEPLOYMENT COMPLETE"
+            EOF
+                    )
+
+          # Encode and send script via SSM
           SCRIPT_B64=$(echo "$DEPLOY_SCRIPT" | base64 -w0)
 
-          cat > /tmp/ssm_cmd.json << SSM_EOF
-          {
+          cat > /tmp/ssm_cmd.json << JSON
+            {
             "commands": [
-              "#!/bin/bash",
-              "set -e",
-              "echo 'Starting full deployment setup...'",
-              "echo '$SCRIPT_B64' | base64 -d > /tmp/deploy_full.sh",
-              "chmod +x /tmp/deploy_full.sh",
-              "/tmp/deploy_full.sh \"$DOMAIN\" \"$EMAIL\" \"$DB_PASSWORD\" \"$MAIN_BRANCH\"",
-              "rm -f /tmp/deploy_full.sh",
-              "echo 'Deployment completed'"
+                "#!/bin/bash",
+                "set -e",
+                "echo 'Decoding deployment script...'",
+                "echo '$SCRIPT_B64' | base64 -d > /tmp/deploy_full.sh",
+                "chmod +x /tmp/deploy_full.sh",
+                "/tmp/deploy_full.sh \"$DOMAIN\" \"$EMAIL\" \"$DB_PASSWORD\"",
+                "DEPLOY_EXIT_CODE=\$?",
+                "rm -f /tmp/deploy_full.sh",
+                "exit \$DEPLOY_EXIT_CODE"
             ]
-          }
-          SSM_EOF
+            }
+            JSON
 
+          echo "📤 Sending deployment command to EC2..."
           aws ssm send-command \
             --instance-ids "$INSTANCE_ID" \
             --document-name "AWS-RunShellScript" \
             --parameters file:///tmp/ssm_cmd.json \
-            --comment "Full App Deployment" \
-            --timeout-seconds 900
+            --comment "Deploy app: clone main + setup env + prisma + SSL" \
+            --timeout-seconds 1200
 
-          echo "✅ Deployment command sent to EC2"
+          echo "✅ Deployment command sent"
           rm -f /tmp/ssm_cmd.json
