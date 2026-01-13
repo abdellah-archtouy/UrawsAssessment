@@ -24,22 +24,34 @@ jobs:
             --parameters 'commands=[
               "set -e",
 
-              "# 1️⃣ Bootstrap repo (once)",
+              "echo \"🚀 START DEPLOY\"",
+
+              "# 1️⃣ Ensure base directories",
+              "mkdir -p /home/ubuntu",
               "cd /home/ubuntu",
+
+              "# 2️⃣ Clone repo if missing",
               "if [ ! -d repo ]; then git clone https://github.com/abdellah-archtouy/UrawsAssessment.git repo; fi",
+
               "cd repo",
+
+              "# 3️⃣ Fetch ALL branches",
               "git fetch origin",
 
-              "# 2️⃣ Sync deploy logic from release",
-              "git checkout release -- deploy",
+              "# 4️⃣ Copy deploy folder from release",
+              "git checkout origin/release -- deploy",
+
+              "# 5️⃣ Move deploy to stable location",
               "rm -rf /home/ubuntu/deploy",
               "mv deploy /home/ubuntu/deploy",
               "chmod +x /home/ubuntu/deploy/deploy.sh",
 
-              "# 3️⃣ Sync app code from main",
+              "# 6️⃣ Update app code from main",
               "git checkout main",
               "git pull origin main",
 
-              "# 4️⃣ Run deploy",
-              "/home/ubuntu/deploy/deploy.sh"
+              "# 7️⃣ Run deploy script",
+              "/home/ubuntu/deploy/deploy.sh",
+
+              "echo \"✅ DEPLOY DONE\""
             ]'
