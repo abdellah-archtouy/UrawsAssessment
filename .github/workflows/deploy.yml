@@ -1,4 +1,4 @@
-name: Deploy with HTTPS (Nginx in Container)
+name: Deploy Application
 
 on:
   push:
@@ -9,160 +9,90 @@ jobs:
     runs-on: ubuntu-latest
     
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-    
-    - name: Configure AWS
+    - name: Configure AWS Credentials
       uses: aws-actions/configure-aws-credentials@v4
       with:
         aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         aws-region: ${{ secrets.AWS_REGION || 'us-east-1' }}
     
-    - name: Create deployment script
-      run: |
-        cat > /tmp/deploy.sh << 'SCRIPT_EOF'
-        #!/bin/bash
-        set -e
-        
-        echo "🚀 Starting deployment"
-        cd /home/ubuntu
-        
-        # Update code
-        if [ -d "app/.git" ]; then
-          cd app
-          git checkout release
-          git pull origin release
-        else
-          git clone -b release https://github.com/abdellah-archtouy/UrawsAssessment.git app
-          cd app
-        fi
-        
-        echo "🐳 Starting application..."
-        docker compose up -d --build
-        
-        sleep 30
-        
-        # Use certbot docker container for SSL
-        echo "🔐 Setting up SSL using Certbot container"
-        
-        # Create directory for certbot challenges
-        mkdir -p /home/ubuntu/app/certbot/www
-        mkdir -p /home/ubuntu/app/certbot/conf
-        
-        # Stop nginx container temporarily for certbot
-        docker compose stop nginx
-        
-        # Run certbot container to get certificates
-        docker run -it --rm \
-          -v "/home/ubuntu/app/certbot/www:/var/www/certbot" \
-          -v "/home/ubuntu/app/certbot/conf:/etc/letsencrypt" \
-          certbot/certbot certonly \
-          --webroot \
-          --webroot-path=/var/www/certbot \
-          --email "$EMAIL" \
-          --agree-tos \
-          --no-eff-email \
-          -d "$DOMAIN" \
-          -d "www.$DOMAIN" \
-          --non-interactive || echo "Certbot may have failed or already has certificates"
-        
-        # Copy certificates to nginx directory
-        mkdir -p /home/ubuntu/app/nginx/ssl
-        cp /home/ubuntu/app/certbot/conf/live/$DOMAIN/fullchain.pem /home/ubuntu/app/nginx/ssl/ 2>/dev/null || true
-        cp /home/ubuntu/app/certbot/conf/live/$DOMAIN/privkey.pem /home/ubuntu/app/nginx/ssl/ 2>/dev/null || true
-        
-        # Update nginx config for SSL
-        if [ -f "/home/ubuntu/app/nginx/nginx.conf" ]; then
-          # Backup original config
-          cp /home/ubuntu/app/nginx/nginx.conf /home/ubuntu/app/nginx/nginx.conf.backup
-          
-          # Create SSL nginx config
-          cat > /home/ubuntu/app/nginx/nginx.conf << NGINX_EOF
-        server {
-            listen 80;
-            server_name $DOMAIN www.$DOMAIN;
-            return 301 https://\$server_name\$request_uri;
-        }
-        
-        server {
-            listen 443 ssl;
-            server_name $DOMAIN www.$DOMAIN;
-        
-            ssl_certificate /etc/nginx/ssl/fullchain.pem;
-            ssl_certificate_key /etc/nginx/ssl/privkey.pem;
-        
-            # Your existing location blocks here
-            location / {
-                proxy_pass http://frontend:3000;
-                proxy_set_header Host \$host;
-                proxy_set_header X-Real-IP \$remote_addr;
-            }
-        
-            location /api {
-                proxy_pass http://backend:5000;
-                proxy_set_header Host \$host;
-                proxy_set_header X-Real-IP \$remote_addr;
-            }
-        }
-        NGINX_EOF
-        
-          # Replace domain variable
-          sed -i "s/\\\$DOMAIN/$DOMAIN/g" /home/ubuntu/app/nginx/nginx.conf
-        fi
-        
-        # Restart all containers
-        docker compose up -d
-        
-        echo "✅ Deployment complete"
-        echo "🔍 Testing HTTPS..."
-        sleep 10
-        curl -I https://$DOMAIN 2>/dev/null | head -1 || echo "HTTPS may not be ready yet"
-        SCRIPT_EOF
-        
-        # Make script executable
-        chmod +x /tmp/deploy.sh
-    
-    - name: Send deployment script via SSM
+    - name: Run SSM Deploy Command
       env:
         INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID }}
         DOMAIN: ${{ secrets.DOMAIN }}
         EMAIL: ${{ secrets.EMAIL }}
       run: |
-        # Read script and escape for JSON
-        SCRIPT_CONTENT=$(cat /tmp/deploy.sh)
+        # Create a simple JSON file with commands
+        cat > ssm_commands.json << 'EOF'
+        {
+          "commands": [
+            "#!/bin/bash",
+            "set -e",
+            "",
+            "echo '🚀 Starting deployment'",
+            "cd /home/ubuntu",
+            "",
+            "# Update or clone the code",
+            "if [ -d \"app/.git\" ]; then",
+            "  cd app",
+            "  git fetch origin",
+            "  git checkout release",
+            "  git pull origin release",
+            "else",
+            "  git clone -b release https://github.com/abdellah-archtouy/UrawsAssessment.git app",
+            "  cd app",
+            "fi",
+            "",
+            "# Deploy with Docker Compose",
+            "echo '🐳 Building and starting containers...'",
+            "docker compose down 2>/dev/null || true",
+            "docker compose up -d --build",
+            "",
+            "# Wait for services to be ready",
+            "echo '⏳ Waiting for services...'",
+            "sleep 30",
+            "",
+            "# Setup HTTPS if certbot is available",
+            "if command -v certbot >/dev/null 2>&1; then",
+            "  echo '🔐 Setting up SSL...'",
+            "  certbot --nginx \\",
+            "    -d \"$DOMAIN\" \\",
+            "    -d \"www.$DOMAIN\" \\",
+            "    --non-interactive \\",
+            "    --agree-tos \\",
+            "    --email \"$EMAIL\" \\",
+            "    --redirect \\",
+            "    --keep-until-expiring || echo 'Certbot already configured'",
+            "fi",
+            "",
+            "# Verify deployment",
+            "echo '✅ Deployment complete!'",
+            "echo '📊 Container status:'",
+            "docker compose ps",
+            "",
+            "# Test connections",
+            "echo '🔍 Testing endpoints...'",
+            "curl -s -o /dev/null -w 'HTTP: %{http_code}\\n' http://localhost || echo 'HTTP test failed'",
+            "curl -s -o /dev/null -w 'HTTPS: %{http_code}\\n' https://localhost 2>/dev/null || echo 'HTTPS test failed (may not be configured)'"
+          ]
+        }
+        EOF
         
-        # Use jq to properly create JSON with escaped content
-        JSON_PAYLOAD=$(jq -n \
-          --arg domain "$DOMAIN" \
-          --arg email "$EMAIL" \
-          --arg script "$SCRIPT_CONTENT" \
-          '{
-            commands: [
-              "#!/bin/bash",
-              "set -e",
-              "export DOMAIN=\"" + $domain + "\"",
-              "export EMAIL=\"" + $email + "\"",
-              "cat > /tmp/deploy_exec.sh << \'EXEC_EOF\'",
-              $script,
-              "EXEC_EOF",
-              "chmod +x /tmp/deploy_exec.sh",
-              "/tmp/deploy_exec.sh"
-            ]
-          }')
+        # Replace environment variables in the JSON file
+        sed -i "s/\$DOMAIN/$DOMAIN/g" ssm_commands.json
+        sed -i "s/\$EMAIL/$EMAIL/g" ssm_commands.json
         
-        echo "$JSON_PAYLOAD" > /tmp/ssm_params.json
+        echo "📤 Sending deployment command to EC2 instance: $INSTANCE_ID"
         
         # Send SSM command
         aws ssm send-command \
           --instance-ids "$INSTANCE_ID" \
           --document-name "AWS-RunShellScript" \
-          --parameters file:///tmp/ssm_params.json \
-          --comment "HTTPS deployment for containerized Nginx" \
-          --timeout-seconds 900 \
-          --output text
+          --parameters file://ssm_commands.json \
+          --comment "Deployment triggered by GitHub Actions" \
+          --timeout-seconds 600
         
         echo "✅ Deployment command sent successfully"
         
         # Cleanup
-        rm -f /tmp/deploy.sh /tmp/ssm_params.json
+        rm -f ssm_commands.json
