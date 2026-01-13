@@ -21,11 +21,11 @@ cd "$DEPLOY_DIR"
 # ==============================
 # Pull latest release branch
 # ==============================
-echo "📦 Fetching latest release branch"
-git fetch origin release
-git checkout release
-git pull origin release
-
+# echo "📦 Fetching latest release branch"
+# git fetch origin release
+# git checkout release
+# git pull origin release
+echo "📦 Skipping git pull (assuming latest code is already in place)"
 # ==============================
 # Stop old containers
 # ==============================
