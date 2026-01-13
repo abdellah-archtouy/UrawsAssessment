@@ -1,8 +1,8 @@
 # Backend Dockerfile
 FROM node:18-alpine
 
-# Install OpenSSL for Prisma
-RUN apk add --no-cache openssl
+# Install OpenSSL and bash for Prisma
+RUN apk add --no-cache openssl bash
 
 WORKDIR /app
 
@@ -19,7 +19,7 @@ RUN npx prisma generate
 # Copy source code
 COPY src ./src
 
-# Expose backend port (internal only, not exposed externally)
+# Expose backend port
 EXPOSE 5000
 
 # Start the application
