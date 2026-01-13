@@ -1,4 +1,4 @@
-name: Deploy with HTTPS
+name: Deploy with Certbot Container
 
 on:
   push:
@@ -9,125 +9,126 @@ jobs:
     runs-on: ubuntu-latest
     
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-      with:
-        fetch-depth: 0
-    
     - name: Configure AWS
       uses: aws-actions/configure-aws-credentials@v4
       with:
         aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        aws-region: ${{ secrets.AWS_REGION || 'us-east-1' }}
+        aws-region: ${{ secrets.AWS_REGION }}
     
-    - name: Run SSM Deployment
+    - name: Run Containerized Deployment
       env:
         INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID }}
-        DOMAIN: ${{ secrets.DOMAIN || 'aarchtou.me' }}
-        EMAIL: ${{ secrets.EMAIL || 'admin@aarchtou.me' }}
+        DOMAIN: ${{ secrets.DOMAIN }}
+        EMAIL: ${{ secrets.EMAIL }}
       run: |
-        # Create a script file to avoid JSON escaping issues
-        cat > /tmp/deploy_script.sh << 'SCRIPT_EOF'
+        # Use single quotes and base64 to avoid escaping issues
+        DEPLOY_SCRIPT=$(cat << 'SCRIPT_EOF'
         #!/bin/bash
         set -e
         
         echo "🚀 Starting deployment"
         cd /home/ubuntu
         
-        # ---- CODE DEPLOY ----
+        # Update code
         if [ -d "app/.git" ]; then
           cd app
-          git fetch origin
           git checkout release
           git pull origin release
         else
-          git clone https://github.com/abdellah-archtouy/UrawsAssessment.git app
+          git clone -b release https://github.com/abdellah-archtouy/UrawsAssessment.git app
           cd app
         fi
         
-        echo "🐳 Starting Docker containers..."
-        docker compose down 2>/dev/null || true
+        echo "🐳 Starting application..."
         docker compose up -d --build
         
-        echo "⏳ Waiting for services to be ready"
-        sleep 15
+        sleep 30
         
-        # ---- CERTBOT INSTALL ----
-        if ! command -v certbot >/dev/null 2>&1; then
-          echo "🔐 Installing Certbot"
-          apt-get update
-          apt-get install -y certbot python3-certbot-nginx
+        # Use certbot docker container for SSL
+        echo "🔐 Setting up SSL using Certbot container"
+        
+        # Create directory for certbot challenges
+        mkdir -p /home/ubuntu/app/certbot/www
+        mkdir -p /home/ubuntu/app/certbot/conf
+        
+        # Stop nginx container temporarily for certbot
+        docker compose stop nginx
+        
+        # Run certbot container to get certificates
+        docker run -it --rm \
+          -v "/home/ubuntu/app/certbot/www:/var/www/certbot" \
+          -v "/home/ubuntu/app/certbot/conf:/etc/letsencrypt" \
+          certbot/certbot certonly \
+          --webroot \
+          --webroot-path=/var/www/certbot \
+          --email "$EMAIL" \
+          --agree-tos \
+          --no-eff-email \
+          -d "$DOMAIN" \
+          -d "www.$DOMAIN" \
+          --non-interactive || echo "Certbot may have failed or already has certificates"
+        
+        # Copy certificates to nginx directory
+        mkdir -p /home/ubuntu/app/nginx/ssl
+        cp /home/ubuntu/app/certbot/conf/live/$DOMAIN/fullchain.pem /home/ubuntu/app/nginx/ssl/ 2>/dev/null || true
+        cp /home/ubuntu/app/certbot/conf/live/$DOMAIN/privkey.pem /home/ubuntu/app/nginx/ssl/ 2>/dev/null || true
+        
+        # Update nginx config for SSL
+        if [ -f "/home/ubuntu/app/nginx/nginx.conf" ]; then
+          # Backup original config
+          cp /home/ubuntu/app/nginx/nginx.conf /home/ubuntu/app/nginx/nginx.conf.backup
+          
+          # Create SSL nginx config
+          cat > /home/ubuntu/app/nginx/nginx.conf << 'NGINX_EOF'
+        server {
+            listen 80;
+            server_name $DOMAIN www.$DOMAIN;
+            return 301 https://$server_name$request_uri;
+        }
+        
+        server {
+            listen 443 ssl;
+            server_name $DOMAIN www.$DOMAIN;
+        
+            ssl_certificate /etc/nginx/ssl/fullchain.pem;
+            ssl_certificate_key /etc/nginx/ssl/privkey.pem;
+        
+            # Your existing location blocks here
+            location / {
+                proxy_pass http://frontend:3000;
+                proxy_set_header Host $host;
+                proxy_set_header X-Real-IP $remote_addr;
+            }
+        
+            location /api {
+                proxy_pass http://backend:5000;
+                proxy_set_header Host $host;
+                proxy_set_header X-Real-IP $remote_addr;
+            }
+        }
+        NGINX_EOF
+        
+          # Replace domain variable
+          sed -i "s/\$DOMAIN/$DOMAIN/g" /home/ubuntu/app/nginx/nginx.conf
         fi
         
-        # ---- SSL CERTIFICATE ----
-        echo "🔒 Requesting/renewing SSL certificate"
+        # Restart all containers
+        docker compose up -d
         
-        # Check if certbot is already configured
-        if [ -f "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" ]; then
-          echo "📜 Certificate exists, renewing..."
-          certbot renew --quiet --no-self-upgrade
-        else
-          echo "📜 Requesting new certificate..."
-          certbot --nginx \
-            -d "$DOMAIN" \
-            -d "www.$DOMAIN" \
-            --non-interactive \
-            --agree-tos \
-            --email "$EMAIL" \
-            --redirect \
-            --hsts \
-            --staple-ocsp
-        fi
-        
-        # ---- RELOAD NGINX ----
-        echo "🔄 Reloading Nginx"
-        nginx -t && systemctl reload nginx
-        
-        echo "✅ Deployment + HTTPS complete"
-        echo "📊 Running containers:"
-        docker compose ps
-        
-        echo "🔍 Checking HTTPS endpoint..."
-        curl -I https://$DOMAIN || echo "⚠️ HTTPS check failed, but deployment completed"
+        echo "✅ Deployment complete"
+        echo "🔍 Testing HTTPS..."
+        sleep 10
+        curl -I https://$DOMAIN 2>/dev/null | head -1 || echo "HTTPS may not be ready yet"
         SCRIPT_EOF
+        )
         
-        # Make script executable
-        chmod +x /tmp/deploy_script.sh
+        # Send via SSM using AWS CLI
+        echo "$DEPLOY_SCRIPT" > /tmp/script.sh
         
-        # Extract commands and properly escape them
-        # Read the script line by line and create a JSON array
-        readarray -t COMMANDS < /tmp/deploy_script.sh
-        
-        # Create JSON array of commands
-        JSON_COMMANDS="["
-        for i in "${!COMMANDS[@]}"; do
-          # Escape special characters for JSON
-          ESCAPED_CMD=$(echo "${COMMANDS[$i]}" | sed 's/\\/\\\\/g' | sed 's/"/\\"/g')
-          JSON_COMMANDS+="\"$ESCAPED_CMD\""
-          if [ $i -lt $((${#COMMANDS[@]} - 1)) ]; then
-            JSON_COMMANDS+=","
-          fi
-        done
-        JSON_COMMANDS+="]"
-        
-        # Create parameters JSON
-        PARAMETERS_JSON="{\"commands\": $JSON_COMMANDS}"
-        
-        echo "📤 Sending deployment command to EC2 instance: $INSTANCE_ID"
-        
-        # Save parameters to a file
-        echo "$PARAMETERS_JSON" > /tmp/ssm_params.json
-        
-        # Send SSM command
+        # Use aws ssm send-command with file parameter
         aws ssm send-command \
           --instance-ids "$INSTANCE_ID" \
           --document-name "AWS-RunShellScript" \
-          --parameters file:///tmp/ssm_params.json \
-          --comment "GitHub Actions deployment triggered by ${{ github.actor }}" \
-          --output text
-        
-        echo "✅ SSM command sent successfully"
-        
-        # Cleanup
-        rm -f /tmp/deploy_script.sh /tmp/ssm_params.json
+          --parameters '{"commands": ["#!/bin/bash", "'"$(sed ':a;N;$!ba;s/\n/", "/g' /tmp/script.sh)"'"]}' \
+          --timeout-seconds 600
