@@ -35,84 +35,84 @@ jobs:
           #!/bin/bash
           set -e
 
-            # Variables
-            DOMAIN="$1"
-            EMAIL="$2"
-            DB_PASSWORD="$3"
-
-            cd /home/ubuntu
-
-            echo "📦 STEP 1: CLONE OR UPDATE MAIN BRANCH"
-            if [ -d "app/.git" ]; then
+          # Variables
+          DOMAIN="$1"
+          EMAIL="$2"
+          DB_PASSWORD="$3"
+                  
+          cd /home/ubuntu
+                  
+          echo "📦 STEP 1: CLONE OR UPDATE MAIN BRANCH"
+          if [ -d "app/.git" ]; then
             cd app
             git fetch origin
             git checkout main
             git pull origin main
-            else
+          else
             git clone -b main https://github.com/abdellah-archtouy/UrawsAssessment.git app
             cd app
-            fi
-
-            echo "✅ Code updated from main branch"
-
-            # Step 2: Setup environment
-            echo "⚙️ STEP 2: SETTING UP ENVIRONMENT"
-            cat > .env << ENV
-            DATABASE_URL=mysql://root:${DB_PASSWORD}@mysql:3306/userdb
-            PORT=5000
-            NODE_ENV=production
-            CORS_ORIGIN=*
-            ENV
-            echo "✅ Environment file created"
-
-            # Step 3: Install certbot if not present
-            if ! command -v certbot >/dev/null 2>&1; then
+          fi
+                  
+          echo "✅ Code updated from main branch"
+                  
+          # Step 2: Setup environment
+          echo "⚙️ STEP 2: SETTING UP ENVIRONMENT"
+          cat > .env << ENV
+          DATABASE_URL=mysql://root:${DB_PASSWORD}@mysql:3306/userdb
+          PORT=5000
+          NODE_ENV=production
+          CORS_ORIGIN=*
+          ENV
+          echo "✅ Environment file created"
+                  
+          # Step 3: Install certbot if not present
+          if ! command -v certbot >/dev/null 2>&1; then
             echo "Installing Certbot..."
             sudo apt update
             sudo apt install -y certbot python3-certbot-nginx
-            fi
-
-            # Step 4: Create directories
-            mkdir -p ./certificates ./certbot/www ./nginx
-
-            # Step 5: Stop previous containers and start fresh
-            echo "🐳 STEP 5: STARTING DOCKER CONTAINERS"
-            docker compose down -v || true
-            docker compose up -d --build
-
-            echo "⏳ Waiting 10s for containers to start..."
-            sleep 10
-
-            # Step 6: Run Prisma migrations in backend
-            echo "🛠️ STEP 6: RUNNING PRISMA MIGRATIONS"
-            docker compose exec backend npx prisma migrate deploy || \
-            docker compose exec backend npx prisma db push --accept-data-loss || \
-            docker compose exec backend npm run migrate || \
-            echo "⚠️ Prisma migrations failed"
-            echo "✅ Prisma migrations attempted"
-
-            # Step 7: Setup SSL certificates with Certbot
-            echo "🔐 STEP 7: SETTING UP SSL CERTIFICATES"
-            docker stop nginx 2>/dev/null || true
-            if sudo certbot certonly --standalone \
-            -d "$DOMAIN" -d "www.$DOMAIN" \
-            --non-interactive --agree-tos \
-            --email "$EMAIL" --force-renewal; then
-                echo "✅ SSL certificate obtained"
-                sudo cp -L /etc/letsencrypt/live/$DOMAIN/fullchain.pem ./certificates/ 2>/dev/null || true
-                sudo cp -L /etc/letsencrypt/live/$DOMAIN/privkey.pem ./certificates/ 2>/dev/null || true
-                sudo chmod 644 ./certificates/fullchain.pem
-                sudo chmod 600 ./certificates/privkey.pem
-            else
-                echo "⚠️ SSL certificate failed, continuing in HTTP mode"
-            fi
-
-            # Step 8: Reload Nginx
-            docker compose exec nginx nginx -t 2>/dev/null || true
-            docker compose exec nginx nginx -s reload 2>/dev/null || true
-
-            echo "✅ DEPLOYMENT COMPLETE"
-            EOF
+          fi
+                  
+          # Step 4: Create directories
+          mkdir -p ./certificates ./certbot/www ./nginx
+                  
+          # Step 5: Stop previous containers and start fresh
+          echo "🐳 STEP 5: STARTING DOCKER CONTAINERS"
+          docker compose down -v || true
+          docker compose up -d --build
+                  
+          echo "⏳ Waiting 10s for containers to start..."
+          sleep 10
+                  
+          # Step 6: Run Prisma migrations in backend
+          echo "🛠️ STEP 6: RUNNING PRISMA MIGRATIONS"
+          docker compose exec backend npx prisma migrate deploy || \
+          docker compose exec backend npx prisma db push --accept-data-loss || \
+          docker compose exec backend npm run migrate || \
+          echo "⚠️ Prisma migrations failed"
+          echo "✅ Prisma migrations attempted"
+                  
+          # Step 7: Setup SSL certificates with Certbot
+          echo "🔐 STEP 7: SETTING UP SSL CERTIFICATES"
+          docker stop nginx 2>/dev/null || true
+          if sudo certbot certonly --standalone \
+             -d "$DOMAIN" -d "www.$DOMAIN" \
+             --non-interactive --agree-tos \
+             --email "$EMAIL" --force-renewal; then
+              echo "✅ SSL certificate obtained"
+              sudo cp -L /etc/letsencrypt/live/$DOMAIN/fullchain.pem ./certificates/ 2>/dev/null || true
+              sudo cp -L /etc/letsencrypt/live/$DOMAIN/privkey.pem ./certificates/ 2>/dev/null || true
+              sudo chmod 644 ./certificates/fullchain.pem
+              sudo chmod 600 ./certificates/privkey.pem
+          else
+              echo "⚠️ SSL certificate failed, continuing in HTTP mode"
+          fi
+                  
+          # Step 8: Reload Nginx
+          docker compose exec nginx nginx -t 2>/dev/null || true
+          docker compose exec nginx nginx -s reload 2>/dev/null || true
+                  
+          echo "✅ DEPLOYMENT COMPLETE"
+          EOF
           )
 
           SCRIPT_B64=$(echo "$DEPLOY_SCRIPT" | base64 -w0)
