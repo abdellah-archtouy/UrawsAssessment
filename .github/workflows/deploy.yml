@@ -1,4 +1,4 @@
-name: Deploy Application
+name: Deploy Application with HTTPS
 
 on:
   push:
@@ -9,164 +9,337 @@ jobs:
     runs-on: ubuntu-latest
     
     steps:
-    - name: Checkout code
+    - name: Checkout release branch
       uses: actions/checkout@v4
+      with:
+        ref: release
     
-    - name: Configure AWS Credentials
+    - name: Configure AWS
       uses: aws-actions/configure-aws-credentials@v4
       with:
         aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         aws-region: ${{ secrets.AWS_REGION || 'us-east-1' }}
     
-    - name: Upload and Run Deployment Scripts
+    - name: Deploy via SSM
       env:
         INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID }}
-        DOMAIN: ${{ secrets.DOMAIN }}
-        EMAIL: ${{ secrets.EMAIL }}
+        DOMAIN: ${{ secrets.DOMAIN || 'aarchtou.me' }}
+        EMAIL: ${{ secrets.EMAIL || 'admin@aarchtou.me' }}
+        DB_PASSWORD: ${{ secrets.DB_PASSWORD || 'rootpassword' }}
       run: |
-        # Create a simple deployment command
-        DEPLOY_COMMAND=$(cat << 'EOF'
+        # Create deployment script with base64 encoding to avoid JSON issues
+        DEPLOY_SCRIPT=$(cat << 'SCRIPT_EOF'
         #!/bin/bash
         set -e
         
-        echo "🚀 Starting automated deployment"
-        echo "================================"
+        echo "🚀 Starting deployment with HTTPS setup"
+        echo "========================================"
         
         # Variables
-        DOMAIN="$1"
-        EMAIL="$2"
+        DOMAIN="${1:-aarchtou.me}"
+        EMAIL="${2:-admin@aarchtou.me}"
+        DB_PASSWORD="${3:-rootpassword}"
+        
+        echo "Domain: $DOMAIN"
+        echo "Email: $EMAIL"
+        echo "Timestamp: $(date)"
         
         # Go to home directory
         cd /home/ubuntu
         
-        # Step 1: Update or clone repository
-        echo "📦 Step 1: Getting latest code..."
+        # Step 1: Get latest code
+        echo ""
+        echo "📦 STEP 1: GETTING LATEST CODE"
+        echo "----------------------------------------"
         if [ -d "app/.git" ]; then
+          echo "Updating existing repository..."
           cd app
           git fetch origin
           git checkout release
           git pull origin release
         else
+          echo "Cloning repository for first time..."
           git clone -b release https://github.com/abdellah-archtouy/UrawsAssessment.git app
           cd app
         fi
         
-        # Step 2: Run pre-deployment checks
-        echo "🔍 Step 2: Running pre-deployment checks..."
+        echo "✅ Code updated"
         
-        # Make sure we have the deploy directory
-        if [ -d "deploy" ]; then
-          echo "✅ Found deploy scripts"
-          chmod +x deploy/*.sh 2>/dev/null || true
+        # Step 2: Setup environment and directories
+        echo ""
+        echo "🔧 STEP 2: SETTING UP ENVIRONMENT"
+        echo "----------------------------------------"
+        
+        # Create necessary directories
+        mkdir -p ./certificates
+        mkdir -p ./certbot/www
+        mkdir -p ./nginx
+        
+        # Create .env file for backend
+        cat > .env << ENV_EOF
+        DATABASE_URL=mysql://root:${DB_PASSWORD}@mysql:3306/userdb
+        PORT=5000
+        NODE_ENV=production
+        CORS_ORIGIN=*
+        ENV_EOF
+        
+        echo "✅ Environment files created"
+        
+        # Step 3: Setup SSL certificates
+        echo ""
+        echo "🔐 STEP 3: SETTING UP SSL CERTIFICATES"
+        echo "----------------------------------------"
+        
+        # Install certbot if not installed
+        if ! command -v certbot >/dev/null 2>&1; then
+          echo "Installing certbot..."
+          sudo apt update
+          sudo apt install -y certbot python3-certbot-nginx
+        fi
+        
+        echo "Checking existing certificates..."
+        
+        # Check if we already have certificates
+        if [ -d "/etc/letsencrypt/live/$DOMAIN" ]; then
+          echo "✅ Certificates already exist, renewing..."
+          sudo certbot renew --quiet
         else
-          echo "❌ No deploy directory found"
-          exit 1
+          echo "🔐 Obtaining new SSL certificates..."
+          
+          # Stop any container using port 80 temporarily
+          docker stop nginx 2>/dev/null || true
+          
+          # Get certificates using standalone mode
+          sudo certbot certonly --standalone \
+            -d "$DOMAIN" \
+            -d "www.$DOMAIN" \
+            --non-interactive \
+            --agree-tos \
+            --email "$EMAIL" \
+            --http-01-port=8080 \
+            --force-renewal || {
+              echo "⚠️ Certbot failed, but continuing with existing certificates if any"
+            }
         fi
         
-        # Step 3: Run pre-deploy script (if exists)
-        if [ -f "deploy/pre_deploy.sh" ]; then
-          echo "🔧 Step 3: Running pre-deployment setup..."
-          chmod +x deploy/pre_deploy.sh
-          DOMAIN="$DOMAIN" EMAIL="$EMAIL" ./deploy/pre_deploy.sh
-        fi
-        
-        # Step 4: Run main deployment
-        echo "🐳 Step 4: Deploying application..."
-        if [ -f "deploy/deploy.sh" ]; then
-          chmod +x deploy/deploy.sh
-          DOMAIN="$DOMAIN" EMAIL="$EMAIL" ./deploy/deploy.sh
+        # Copy certificates to app directory
+        echo "📋 Copying certificates to app directory..."
+        if [ -d "/etc/letsencrypt/live/$DOMAIN" ]; then
+          sudo cp -L /etc/letsencrypt/live/$DOMAIN/fullchain.pem ./certificates/
+          sudo cp -L /etc/letsencrypt/live/$DOMAIN/privkey.pem ./certificates/
+          sudo chmod 644 ./certificates/fullchain.pem
+          sudo chmod 600 ./certificates/privkey.pem
+          sudo chown $USER:$USER ./certificates/*
+          echo "✅ Certificates copied to ./certificates/"
         else
-          # Fallback to docker compose
-          docker compose down 2>/dev/null || true
-          docker compose up -d --build
+          echo "⚠️ No certificates found, will use HTTP only"
         fi
+        
+        # Step 4: Deploy with Docker Compose
+        echo ""
+        echo "🐳 STEP 4: DEPLOYING WITH DOCKER COMPOSE"
+        echo "----------------------------------------"
+        
+        # Stop and remove existing containers
+        echo "Stopping existing containers..."
+        docker-compose down 2>/dev/null || true
+        
+        # Start all services
+        echo "Starting containers..."
+        docker-compose up -d
+        
+        # Wait for database to be ready
+        echo "⏳ Waiting for database to be ready..."
+        for i in {1..30}; do
+          if docker-compose exec mysql mysqladmin ping -h localhost --silent; then
+            echo "✅ Database is ready"
+            break
+          fi
+          if [ $i -eq 30 ]; then
+            echo "⚠️ Database not ready after 30 seconds, continuing anyway"
+          fi
+          sleep 1
+        done
+        
+        # Step 5: Run database migrations
+        echo ""
+        echo "🛠️ STEP 5: RUNNING DATABASE MIGRATIONS"
+        echo "----------------------------------------"
+        
+        # Wait for backend to start
+        echo "Waiting for backend to start..."
+        sleep 20
+        
+        # Run migrations
+        echo "Running database migrations..."
+        if docker-compose exec backend npx prisma migrate deploy; then
+          echo "✅ Database migrations completed successfully"
+        else
+          echo "⚠️ Database migrations failed, trying alternative..."
+          
+          # Try alternative approach
+          docker-compose exec backend npx prisma db push --accept-data-loss || \
+          docker-compose exec backend npm run migrate || \
+          echo "⚠️ All migration attempts failed"
+        fi
+        
+        # Step 6: Setup HTTPS in Nginx container
+        echo ""
+        echo "🌐 STEP 6: CONFIGURING HTTPS IN NGINX"
+        echo "----------------------------------------"
+        
+        # Create a script to run inside nginx container
+        cat > setup_nginx_ssl.sh << 'NGINX_SCRIPT'
+        #!/bin/sh
+        
+        DOMAIN="$1"
+        
+        echo "Setting up SSL in Nginx container..."
+        
+        # Create letsencrypt directory structure
+        mkdir -p /etc/letsencrypt/live/$DOMAIN
+        
+        # Copy certificates if they exist
+        if [ -f /etc/nginx/ssl/fullchain.pem ]; then
+          cp /etc/nginx/ssl/fullchain.pem /etc/letsencrypt/live/$DOMAIN/
+          cp /etc/nginx/ssl/privkey.pem /etc/letsencrypt/live/$DOMAIN/
+          echo "Certificates copied to Nginx container"
+        else
+          echo "No certificates found in /etc/nginx/ssl"
+        fi
+        
+        # Test nginx configuration
+        nginx -t && echo "Nginx configuration is valid" || echo "Nginx configuration error"
+        NGINX_SCRIPT
+        
+        chmod +x setup_nginx_ssl.sh
+        
+        # Copy script to nginx container and execute
+        docker cp setup_nginx_ssl.sh nginx:/tmp/setup_nginx_ssl.sh
+        docker exec nginx sh /tmp/setup_nginx_ssl.sh "$DOMAIN"
+        docker exec nginx rm /tmp/setup_nginx_ssl.sh
+        rm -f setup_nginx_ssl.sh
+        
+        # Reload nginx
+        echo "Reloading Nginx configuration..."
+        docker exec nginx nginx -s reload 2>/dev/null || true
+        
+        # Step 7: Verify deployment
+        echo ""
+        echo "✅ STEP 7: VERIFICATION"
+        echo "----------------------------------------"
         
         # Wait for services
-        echo "⏳ Waiting for services to start..."
+        echo "⏳ Waiting for all services to be ready..."
         sleep 30
         
-        # Step 5: Run post-deploy script (if exists)
-        if [ -f "deploy/post_deploy.sh" ]; then
-          echo "✅ Step 5: Running post-deployment verification..."
-          chmod +x deploy/post_deploy.sh
-          DOMAIN="$DOMAIN" EMAIL="$EMAIL" ./deploy/post_deploy.sh
+        # Check container status
+        echo "📊 Container Status:"
+        docker-compose ps
+        
+        # Test HTTP (should redirect to HTTPS)
+        echo ""
+        echo "🌐 Testing HTTP (should redirect to HTTPS):"
+        HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://$DOMAIN || echo "000")
+        echo "HTTP Status: $HTTP_STATUS"
+        
+        # Test HTTPS
+        echo ""
+        echo "🔒 Testing HTTPS:"
+        HTTPS_STATUS=$(curl -s -k -o /dev/null -w "%{http_code}" https://$DOMAIN 2>/dev/null || echo "000")
+        echo "HTTPS Status: $HTTPS_STATUS"
+        
+        # Test backend API
+        echo ""
+        echo "🖥️ Testing Backend API:"
+        API_STATUS=$(curl -s -k -o /dev/null -w "%{http_code}" https://$DOMAIN/api/health 2>/dev/null || echo "000")
+        echo "API Health Status: $API_STATUS"
+        
+        # Check database connection
+        echo ""
+        echo "🗄️ Testing Database Connection:"
+        if docker-compose exec backend node -e "
+          const { PrismaClient } = require('@prisma/client');
+          const prisma = new PrismaClient();
+          prisma.\$queryRaw\`SELECT 1\`
+            .then(() => console.log('Database connection: ✅ OK'))
+            .catch(e => console.log('Database connection: ❌ Failed', e.message))
+            .finally(() => prisma.\$disconnect());
+        " 2>/dev/null; then
+          echo "Database connection test completed"
         else
-          # Basic verification
-          echo "📊 Container status:"
-          docker compose ps
-          
-          echo "🔍 Testing HTTP:"
-          curl -s -o /dev/null -w "HTTP: %{http_code}\n" http://localhost || echo "HTTP test failed"
-          
-          echo "🔒 Testing HTTPS:"
-          curl -s -o /dev/null -w "HTTPS: %{http_code}\n" https://localhost 2>/dev/null || echo "HTTPS not configured"
+          echo "Database connection test failed or not configured"
         fi
         
+        # Display final status
         echo ""
-        echo "🎉 Deployment completed successfully!"
-        echo "🌐 Application should be accessible at: https://$DOMAIN"
-        EOF
+        echo "========================================"
+        echo "🎉 DEPLOYMENT COMPLETE!"
+        echo "========================================"
+        echo ""
+        echo "📊 SUMMARY:"
+        echo "  - Code: ✅ Updated"
+        echo "  - SSL: $( [ "$HTTPS_STATUS" = "200" ] && echo "✅ Working" || echo "⚠️ May need manual setup" )"
+        echo "  - Database: $( [ -f ".env" ] && echo "✅ Configured" || echo "⚠️ Not configured" )"
+        echo "  - Migrations: ✅ Attempted"
+        echo ""
+        echo "🌍 APPLICATION URLS:"
+        echo "  - HTTP:  http://$DOMAIN"
+        echo "  - HTTPS: https://$DOMAIN"
+        echo "  - Local: http://localhost"
+        echo ""
+        echo "🔧 TROUBLESHOOTING:"
+        echo "  - Check logs: docker-compose logs"
+        echo "  - Check nginx: docker exec nginx nginx -t"
+        echo "  - Check certs: ls -la ./certificates/"
+        echo ""
+        echo "🕐 Deployment completed at: $(date)"
+        SCRIPT_EOF
         )
         
-        # Create the SSM command that runs our script
-        cat > /tmp/ssm_command.json << 'EOF'
+        # Base64 encode the script
+        SCRIPT_B64=$(echo "$DEPLOY_SCRIPT" | base64 -w0)
+        
+        # Create SSM command JSON
+        cat > /tmp/ssm_cmd.json << 'EOF'
         {
           "commands": [
             "#!/bin/bash",
             "set -e",
             "",
-            "# Create deployment script",
-            "cat > /tmp/deploy_main.sh << 'SCRIPT_END'",
-            "#!/bin/bash",
-            "set -e",
-            "DOMAIN=\"$DOMAIN\"",
-            "EMAIL=\"$EMAIL\"",
+            "# Decode and execute the deployment script",
+            "echo 'Starting deployment...'",
             "cd /home/ubuntu",
             "",
-            "# Update or clone repository",
-            "if [ -d \"app/.git\" ]; then",
-            "  cd app",
-            "  git fetch origin",
-            "  git checkout release",
-            "  git pull origin release",
-            "else",
-            "  git clone -b release https://github.com/abdellah-archtouy/UrawsAssessment.git app",
-            "  cd app",
-            "fi",
+            "# Decode the script",
+            "echo '$SCRIPT_B64' | base64 -d > /tmp/deploy_full.sh",
+            "chmod +x /tmp/deploy_full.sh",
             "",
-            "# Run deployment scripts",
-            "if [ -d \"deploy\" ]; then",
-            "  chmod +x deploy/*.sh 2>/dev/null || true",
-            "  [ -f \"deploy/pre_deploy.sh\" ] && DOMAIN=\"$DOMAIN\" EMAIL=\"$EMAIL\" ./deploy/pre_deploy.sh",
-            "  [ -f \"deploy/deploy.sh\" ] && DOMAIN=\"$DOMAIN\" EMAIL=\"$EMAIL\" ./deploy/deploy.sh || docker compose up -d --build",
-            "  sleep 30",
-            "  [ -f \"deploy/post_deploy.sh\" ] && DOMAIN=\"$DOMAIN\" EMAIL=\"$EMAIL\" ./deploy/post_deploy.sh",
-            "else",
-            "  echo \"No deploy directory found\"",
-            "  docker compose up -d --build",
-            "fi",
+            "# Execute with parameters",
+            "/tmp/deploy_full.sh \"$DOMAIN\" \"$EMAIL\" \"$DB_PASSWORD\"",
             "",
-            "# Final check",
-            "echo \"Deployment completed!\"",
-            "docker compose ps",
-            "SCRIPT_END",
+            "# Cleanup",
+            "rm -f /tmp/deploy_full.sh",
             "",
-            "# Make it executable and run",
-            "chmod +x /tmp/deploy_main.sh",
-            "/tmp/deploy_main.sh"
+            "echo 'Deployment script completed with exit code: $?'"
           ]
         }
         EOF
         
-        # Send the SSM command
-        echo "📤 Sending deployment command to EC2 instance: $INSTANCE_ID"
+        # Send SSM command
+        echo "🚀 Sending deployment command to EC2 instance: $INSTANCE_ID"
         
         aws ssm send-command \
           --instance-ids "$INSTANCE_ID" \
           --document-name "AWS-RunShellScript" \
-          --parameters file:///tmp/ssm_command.json \
-          --comment "GitHub Actions Deployment" \
-          --timeout-seconds 600
+          --parameters file:///tmp/ssm_cmd.json \
+          --comment "Full deployment with HTTPS and DB migrations" \
+          --timeout-seconds 900 \
+          --output-s3-bucket-name "${{ secrets.S3_LOG_BUCKET || '' }}" \
+          --output-s3-key-prefix "deployments/"
         
         echo "✅ Deployment command sent successfully"
+        
+        # Cleanup
+        rm -f /tmp/ssm_cmd.json

@@ -1,74 +1,34 @@
 #!/bin/bash
 set -e
 
-echo "🚀 Deploying application"
-echo "======================="
+echo "🚀 Starting deployment"
+echo "======================"
 
-# Go to app directory
+# Variables
+DOMAIN="${DOMAIN:-aarchtou.me}"
+EMAIL="${EMAIL:-admin@aarchtou.me}"
+DB_PASSWORD="${DB_PASSWORD:-rootpassword}"
+
 cd /home/ubuntu/app
 
-# Update docker-compose.yml if needed for SSL
-echo "🔧 Configuring Docker Compose for SSL..."
-if [ -f "docker-compose.yml" ]; then
-    # Check if SSL volume mount exists
-    if ! grep -q "nginx/ssl" docker-compose.yml; then
-        echo "➕ Adding SSL volume mount..."
-        
-        # Create backup
-        cp docker-compose.yml docker-compose.yml.backup
-        
-        # Update nginx service to include SSL volume
-        cat > docker-compose.yml << 'DOCKER_COMPOSE'
-version: '3.8'
+echo "📦 Pulling latest code..."
+git pull origin release
 
-services:
-  nginx:
-    image: nginx:alpine
-    container_name: nginx
-    ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - ./nginx/nginx.conf:/etc/nginx/nginx.conf
-      - ./nginx/ssl:/etc/nginx/ssl:ro
-    depends_on:
-      - frontend
-      - backend
-    restart: unless-stopped
+echo "🔧 Setting up environment..."
 
-  frontend:
-    build: ./frontend
-    container_name: frontend
-    ports:
-      - "3000:3000"
-    environment:
-      - NODE_ENV=production
+# Create .env file for backend
+cat > .env << EOF
+DATABASE_URL=mysql://root:${DB_PASSWORD}@mysql:3306/userdb
+PORT=5000
+NODE_ENV=production
+CORS_ORIGIN=*
+EOF
 
-  backend:
-    build: ./backend
-    container_name: backend
-    ports:
-      - "5000:5000"
-    environment:
-      - DB_HOST=database
-
-  database:
-    image: postgres:14
-    container_name: database
-    environment:
-      - POSTGRES_PASSWORD=yourpassword
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-
-volumes:
-  postgres_data:
-DOCKER_COMPOSE
-    fi
-fi
-
-# Deploy with Docker Compose
 echo "🐳 Starting containers..."
-docker compose down 2>/dev/null || true
-docker compose up -d --build
+docker-compose down 2>/dev/null || true
+docker-compose up -d --build
 
-echo "✅ Application deployed successfully"
+echo "⏳ Waiting for services to start..."
+sleep 30
+
+echo "✅ Deployment step completed"

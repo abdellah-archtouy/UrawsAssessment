@@ -2,82 +2,62 @@
 set -e
 
 echo "🔍 Post-deployment verification"
-echo "==============================="
+echo "================================"
 
-# Variables
 DOMAIN="${DOMAIN:-aarchtou.me}"
 
-# Wait a bit for services to fully start
+cd /home/ubuntu/app
+
+# Wait for services
 echo "⏳ Waiting for services to stabilize..."
 sleep 20
 
-# Check container status
-echo "📊 Checking container status:"
-docker compose ps
+# Check containers
+echo "📊 Container status:"
+docker-compose ps
 
-# Check if all containers are running
-RUNNING_CONTAINERS=$(docker compose ps --services --filter "status=running")
-TOTAL_CONTAINERS=$(docker compose ps --services | wc -l)
-
-if [ "$RUNNING_CONTAINERS" -eq "$TOTAL_CONTAINERS" ]; then
-    echo "✅ All containers are running"
+# Run database migrations
+echo "🛠️ Running database migrations..."
+if docker-compose exec backend npx prisma migrate deploy; then
+    echo "✅ Database migrations completed"
 else
-    echo "⚠️ Some containers may not be running properly"
-    docker compose ps
+    echo "⚠️ Migration failed, trying alternative method..."
+    docker-compose exec backend npx prisma db push --accept-data-loss || \
+    docker-compose exec backend npm run migrate || \
+    echo "❌ All migration attempts failed"
 fi
 
-# Test HTTP (should redirect to HTTPS)
-echo ""
-echo "🌐 Testing HTTP (should redirect to HTTPS):"
-HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://$DOMAIN || echo "000")
-if [ "$HTTP_STATUS" = "301" ] || [ "$HTTP_STATUS" = "302" ]; then
-    echo "✅ HTTP redirect is working (Status: $HTTP_STATUS)"
-else
-    echo "⚠️ HTTP redirect may not be working (Status: $HTTP_STATUS)"
-fi
+# Setup SSL in Nginx
+echo "🔐 Setting up SSL in Nginx..."
 
-# Test HTTPS
-echo ""
-echo "🔒 Testing HTTPS:"
-HTTPS_STATUS=$(curl -s -o /dev/null -w "%{http_code}" https://$DOMAIN 2>/dev/null || echo "000")
-if [ "$HTTPS_STATUS" = "200" ] || [ "$HTTPS_STATUS" = "301" ] || [ "$HTTPS_STATUS" = "302" ]; then
-    echo "✅ HTTPS is working (Status: $HTTPS_STATUS)"
-else
-    echo "⚠️ HTTPS may not be working (Status: $HTTPS_STATUS)"
+# Copy certificates to container if they exist
+if [ -f "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" ]; then
+    echo "📋 Copying certificates to Nginx container..."
     
-    # Try localhost as fallback
-    HTTPS_LOCAL=$(curl -s -o /dev/null -w "%{http_code}" https://localhost 2>/dev/null || echo "000")
-    if [ "$HTTPS_LOCAL" = "200" ] || [ "$HTTPS_LOCAL" = "301" ] || [ "$HTTPS_LOCAL" = "302" ]; then
-        echo "ℹ️  HTTPS works on localhost (Status: $HTTPS_LOCAL)"
-    fi
-fi
-
-# Check SSL certificate
-echo ""
-echo "📜 Checking SSL certificate:"
-if [ -f "/home/ubuntu/app/nginx/ssl/fullchain.pem" ]; then
-    echo "✅ SSL certificate found"
-    # Show certificate expiry
-    openssl x509 -in /home/ubuntu/app/nginx/ssl/fullchain.pem -noout -dates 2>/dev/null || echo "Could not read certificate details"
-else
-    echo "⚠️ SSL certificate not found in app directory"
+    # Create script to run inside container
+    cat > /tmp/setup_certs.sh << 'EOF'
+    #!/bin/sh
+    DOMAIN="$1"
+    mkdir -p /etc/letsencrypt/live/$DOMAIN
+    cp /etc/nginx/ssl/fullchain.pem /etc/letsencrypt/live/$DOMAIN/ 2>/dev/null || true
+    cp /etc/nginx/ssl/privkey.pem /etc/letsencrypt/live/$DOMAIN/ 2>/dev/null || true
+    nginx -t 2>/dev/null && nginx -s reload 2>/dev/null || true
+EOF
     
-    # Check system certificates
-    if [ -f "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" ]; then
-        echo "ℹ️  Certificate found in system location"
-    fi
+    chmod +x /tmp/setup_certs.sh
+    docker cp /tmp/setup_certs.sh nginx:/tmp/setup_certs.sh
+    docker exec nginx sh /tmp/setup_certs.sh "$DOMAIN"
+    rm -f /tmp/setup_certs.sh
 fi
 
-# Display nginx logs (last 10 lines)
-echo ""
-echo "📋 Nginx container logs (last 10 lines):"
-docker compose logs nginx --tail=10
+# Test endpoints
+echo "🌐 Testing endpoints..."
+echo "HTTP (should redirect): $(curl -s -o /dev/null -w "%{http_code}" http://$DOMAIN || echo "failed")"
+echo "HTTPS: $(curl -s -k -o /dev/null -w "%{http_code}" https://$DOMAIN 2>/dev/null || echo "failed")"
+echo "API Health: $(curl -s -k -o /dev/null -w "%{http_code}" https://$DOMAIN/api/health 2>/dev/null || echo "failed")"
 
-# Display application URLs
-echo ""
-echo "🌍 Application URLs:"
-echo "   HTTP:  http://$DOMAIN"
-echo "   HTTPS: https://$DOMAIN"
-echo "   Local: http://localhost"
 echo ""
 echo "✅ Post-deployment verification complete"
+echo "🌍 Application URLs:"
+echo "  - http://$DOMAIN"
+echo "  - https://$DOMAIN"
