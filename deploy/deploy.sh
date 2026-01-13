@@ -7,7 +7,7 @@ echo "🚀 Starting deployment"
 # Paths & configuration
 # ==============================
 DEPLOY_DIR="/home/ubuntu/deploy"   # where this deploy.sh lives
-APP_DIR="/home/ubuntu/app"         # your app files
+APP_DIR="/home/ubuntu/repo"         # your app files
 DOMAIN="aarchtou.me"
 EMAIL="admin@aarchtou.me"
 
