@@ -4,64 +4,49 @@ set -e
 echo "🚀 Starting deployment"
 
 # ==============================
-# Paths & configuration
+# Paths & config
 # ==============================
-DEPLOY_DIR="/home/ubuntu/deploy"   # where this deploy.sh lives
-APP_DIR="/home/ubuntu/repo"         # your app files
+APP_DIR="/home/ubuntu/repo"
 DOMAIN="aarchtou.me"
 EMAIL="admin@aarchtou.me"
 
-CERT_PATH="/etc/letsencrypt/live/${DOMAIN}/fullchain.pem"
+CERT_PATH="$APP_DIR/certbot/conf/live/${DOMAIN}/fullchain.pem"
 
-# ==============================
-# Make sure we are in deploy dir
-# ==============================
-cd "$DEPLOY_DIR"
+cd "$APP_DIR"
 
-# ==============================
-# Pull latest release branch
-# ==============================
-# echo "📦 Fetching latest release branch"
-# git fetch origin release
-# git checkout release
-# git pull origin release
-echo "📦 Skipping git pull (assuming latest code is already in place)"
 # ==============================
 # Stop old containers
 # ==============================
 echo "🐳 Stopping old containers"
-docker compose -f "$APP_DIR/docker-compose.yml" down || true
+docker compose down || true
 
 # ==============================
-# Build & start containers
+# Pull latest images
 # ==============================
-echo "🐳 Building and starting containers"
-docker compose -f "$APP_DIR/docker-compose.yml" up -d --build mysql backend frontend nginx
+echo "📦 Pulling latest images"
+docker compose pull
 
 # ==============================
-# Wait for backend
+# Start core services
 # ==============================
-echo "⏳ Waiting for backend to be ready"
+echo "🐳 Starting services"
+docker compose up -d mysql backend frontend nginx
+
+# ==============================
+# Wait for backend health
+# ==============================
+echo "⏳ Waiting for backend"
 sleep 10
 
 # ==============================
-# Prisma migration (SAFE)
-# ==============================
-echo "🛠️ Running Prisma migrations"
-docker compose -f "$APP_DIR/docker-compose.yml" exec backend npx prisma migrate deploy \
-  || docker compose -f "$APP_DIR/docker-compose.yml" exec backend npx prisma db push
-
-echo "✅ Prisma migration done"
-
-# ==============================
-# SSL certificate (ONLY if missing)
+# SSL certificate (only once)
 # ==============================
 if [ ! -f "$CERT_PATH" ]; then
-  echo "🔐 SSL certificate not found — generating..."
+  echo "🔐 SSL certificate not found — generating"
 
-  docker compose -f "$APP_DIR/docker-compose.yml" stop nginx || true
+  docker compose stop nginx || true
 
-  docker compose -f "$APP_DIR/docker-compose.yml" run --rm certbot certonly \
+  docker compose run --rm certbot certonly \
     --webroot \
     --webroot-path /var/www/certbot \
     -d "$DOMAIN" -d "www.$DOMAIN" \
@@ -71,13 +56,13 @@ if [ ! -f "$CERT_PATH" ]; then
 
   echo "✅ SSL certificate generated"
 else
-  echo "🔒 SSL certificate already exists — skipping"
+  echo "🔒 SSL certificate already exists"
 fi
 
 # ==============================
 # Restart nginx
 # ==============================
 echo "🔄 Restarting nginx"
-docker compose -f "$APP_DIR/docker-compose.yml" restart nginx
+docker compose restart nginx
 
 echo "✅ Deployment completed successfully"
