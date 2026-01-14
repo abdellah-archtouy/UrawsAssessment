@@ -70,15 +70,22 @@ services:
       - app-network
 
   # Certbot for HTTPS
+    # Certbot for HTTPS
   certbot:
     image: certbot/certbot
     container_name: youraws-certbot
     volumes:
       - ./certbot/www:/var/www/certbot
       - ./certbot/conf:/etc/letsencrypt
-    command: certonly --webroot --webroot-path=/var/www/certbot \
-      --email admin@aarchtou.me --agree-tos --no-eff-email \
-      -d aarchtou.me -d www.aarchtou.me
+    command: >
+      certonly
+      --webroot
+      --webroot-path=/var/www/certbot
+      --agree-tos
+      --no-eff-email
+      --email admin@aarchtou.me
+      -d aarchtou.me
+      -d www.aarchtou.me
 
 networks:
   app-network:
