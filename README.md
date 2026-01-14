@@ -1,6 +1,40 @@
 # User Management System - YourAWS Technical Assessment
 
-A full-stack user management application with React frontend, Node.js/Express backend, MySQL database, fully containerized with Docker and deployable to any VPS.
+A full-stack user management application with React frontend, Node.js/Express backend, MySQL database, fully containerized with Docker and deployable to any VPS. Features automated CI/CD pipeline with blue-green deployment to AWS EC2.
+
+## 🚀 Quick Start
+
+### For Automated Deployment to AWS EC2:
+
+1. **Fork/Clone this repository**
+2. **Configure GitHub Secrets** (see Automated Deployment section below)
+3. **Set up your EC2 instance** with Docker and SSM Agent
+4. **Trigger deployment:**
+   ```bash
+   git checkout release
+   echo "Deploy $(date)" > deploy-trigger.txt
+   git add deploy-trigger.txt
+   git commit -m "chore: trigger deployment"
+   git push origin release
+   ```
+5. **Watch deployment** in GitHub Actions tab
+6. **Access your app** at `http://YOUR_EC2_PUBLIC_IP`
+
+### For Local Development:
+
+```bash
+# Clone repository
+git clone <your-repo-url>
+cd UrawsAssessment
+
+# Run with Docker Compose
+docker-compose up -d
+
+# Access application
+open http://localhost
+```
+
+---
 
 ## 🏗️ Architecture
 
@@ -54,6 +88,9 @@ A full-stack user management application with React frontend, Node.js/Express ba
 - ✅ All containers on same network
 - ✅ Health checks for reliability
 - ✅ Images pushed to Docker Hub
+- ✅ **Automated CI/CD Pipeline with Blue-Green Deployment**
+- ✅ **Auto-deploy from release branch to AWS EC2**
+- ✅ **Zero-downtime deployments with rollback capability**
 
 ## 🛠️ Technology Stack
 
@@ -198,6 +235,48 @@ npm run dev
 
 Access at http://localhost:3000
 
+## 📁 Project Structure
+
+```
+UrawsAssessment/
+├── .github/
+│   └── workflows/
+│       └── release-deploy.yml        # CI/CD pipeline configuration
+├── backend/
+│   ├── prisma/
+│   │   └── schema.prisma             # Database schema
+│   ├── src/
+│   │   ├── routes/                   # API routes
+│   │   ├── controllers/              # Business logic
+│   │   └── middleware/               # Error handling, validation
+│   ├── Dockerfile                    # Backend container image
+│   └── package.json
+├── frontend/
+│   ├── src/
+│   │   ├── components/               # React components
+│   │   ├── pages/                    # Page components
+│   │   ├── services/                 # API client
+│   │   └── App.jsx
+│   ├── Dockerfile                    # Frontend container image
+│   └── package.json
+├── nginx/
+│   └── nginx.conf                    # Reverse proxy configuration
+├── deploy/
+│   ├── deploy.sh                     # Deployment script
+│   ├── pre_deploy.sh                 # Pre-deployment checks
+│   └── post_deploy.sh                # Post-deployment verification
+├── docker-compose.yml                # Multi-container orchestration
+├── deploy-trigger.txt                # Triggers CI/CD when updated
+└── README.md
+```
+
+### Key Files for CI/CD
+
+- **`.github/workflows/release-deploy.yml`** - GitHub Actions workflow that handles automated deployment
+- **`deploy-trigger.txt`** - Update this file on `release` branch to trigger deployment
+- **`docker-compose.yml`** - Downloaded from main branch during deployment
+- **`nginx/nginx.conf`** - Nginx configuration for reverse proxy
+
 ## 🐳 Docker Hub Images
 
 The application images are publicly available on Docker Hub:
@@ -212,6 +291,226 @@ docker pull aarchtou/youraws-frontend:latest
 ```
 
 ## ☁️ VPS Deployment (AWS EC2)
+
+### Deployment Options
+
+You have two deployment options:
+
+1. **🚀 Automated Deployment (Recommended)** - Uses GitHub Actions to auto-deploy from the `release` branch
+2. **🔧 Manual Deployment** - Traditional SSH and Docker Compose approach
+
+---
+
+## 🚀 Option 1: Automated Deployment Pipeline
+
+This project includes a complete CI/CD pipeline that automatically deploys to AWS EC2 when you push to the `release` branch.
+
+### Pipeline Features
+
+- ✅ **Blue-Green Deployment** - Zero downtime deployments
+- ✅ **Automatic Image Building** - Builds Docker images from `main` branch
+- ✅ **AWS SSM Integration** - No SSH keys needed
+- ✅ **Rollback Capability** - Previous releases preserved
+- ✅ **Health Checks** - Automated verification
+- ✅ **Release Tracking** - Timestamped releases
+
+### How It Works
+
+```
+┌─────────────┐     ┌──────────────┐     ┌──────────────┐     ┌─────────────┐
+│   main      │────▶│ GitHub       │────▶│ Build        │────▶│ Docker Hub  │
+│   branch    │     │ Actions      │     │ Images       │     │             │
+└─────────────┘     └──────────────┘     └──────────────┘     └─────────────┘
+                                                                       │
+┌─────────────┐     ┌──────────────┐     ┌──────────────┐            │
+│  release    │────▶│ Trigger      │────▶│ Deploy to    │◀───────────┘
+│  branch     │     │ Deployment   │     │ AWS EC2      │
+└─────────────┘     └──────────────┘     └──────────────┘
+                                                │
+                                          ┌─────▼─────────┐
+                                          │ Blue-Green    │
+                                          │ Switch        │
+                                          └───────────────┘
+```
+
+### Prerequisites
+
+1. **AWS Account Setup:**
+   - EC2 instance running Ubuntu 22.04
+   - AWS SSM Agent installed and running
+   - IAM role with SSM permissions attached to EC2
+   - Docker and Docker Compose installed on EC2
+
+2. **GitHub Secrets Configuration:**
+   
+   Go to your GitHub repository → Settings → Secrets and variables → Actions → New repository secret:
+
+   | Secret Name              | Description                          | Example                                    |
+   |--------------------------|--------------------------------------|--------------------------------------------|
+   | `AWS_ACCESS_KEY_ID`      | AWS IAM Access Key                   | `AKIAIOSFODNN7EXAMPLE`                     |
+   | `AWS_SECRET_ACCESS_KEY`  | AWS IAM Secret Key                   | `wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY` |
+   | `EC2_INSTANCE_ID`        | Your EC2 Instance ID                 | `i-0123456789abcdef0`                      |
+   | `DOCKERHUB_TOKEN`        | Docker Hub Access Token (optional)   | `dckr_pat_...`                             |
+
+### Step-by-Step Deployment Setup
+
+#### 1. Set Up AWS EC2 Instance
+
+```bash
+# Launch EC2 instance (Ubuntu 22.04 LTS, t2.micro or t2.small)
+# Security Group: Allow port 80 (HTTP) from 0.0.0.0/0
+#                 Allow port 22 (SSH) from your IP
+
+# Connect to instance
+ssh -i your-key.pem ubuntu@YOUR_EC2_PUBLIC_IP
+
+# Install Docker
+sudo apt update
+curl -fsSL https://get.docker.com -o get-docker.sh
+sudo sh get-docker.sh
+sudo usermod -aG docker ubuntu
+
+# Install Docker Compose
+sudo curl -L "https://github.com/docker/compose/releases/download/v2.24.0/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+sudo chmod +x /usr/local/bin/docker-compose
+
+# Verify SSM agent is running
+sudo systemctl status amazon-ssm-agent
+```
+
+#### 2. Create IAM Role for EC2
+
+1. Go to AWS IAM Console → Roles → Create role
+2. Select "AWS service" → "EC2"
+3. Attach policy: `AmazonSSMManagedInstanceCore`
+4. Name: `EC2-SSM-Role`
+5. Attach this role to your EC2 instance
+
+#### 3. Create IAM User for GitHub Actions
+
+1. Go to AWS IAM Console → Users → Create user
+2. User name: `github-actions-deploy`
+3. Attach policies:
+   - `AmazonSSMFullAccess` (or create custom policy with limited SSM permissions)
+   - `AmazonEC2ReadOnlyAccess`
+4. Create access key → Save credentials
+
+#### 4. Configure GitHub Secrets
+
+Add the following secrets to your repository:
+
+```bash
+# Go to: https://github.com/YOUR_USERNAME/YOUR_REPO/settings/secrets/actions
+
+AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE
+AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+EC2_INSTANCE_ID=i-0123456789abcdef0
+DOCKERHUB_TOKEN=dckr_pat_xxxxx (optional)
+```
+
+#### 5. Trigger Deployment
+
+The deployment automatically triggers when you:
+
+1. **Update the trigger file on release branch:**
+
+```bash
+# On your local machine
+git checkout release
+echo "Deploy $(date)" > deploy-trigger.txt
+git add deploy-trigger.txt
+git commit -m "chore: trigger deployment"
+git push origin release
+```
+
+2. **Watch the deployment:**
+   - Go to GitHub → Actions tab
+   - Click on the running workflow
+   - Monitor deployment progress
+
+3. **Verify deployment:**
+
+```bash
+# Check your application
+curl http://YOUR_EC2_PUBLIC_IP/health
+curl http://YOUR_EC2_PUBLIC_IP
+
+# SSH to EC2 and check releases
+ssh -i your-key.pem ubuntu@YOUR_EC2_PUBLIC_IP
+ls -la /home/ubuntu/releases/
+docker-compose ps
+```
+
+### Deployment Workflow Details
+
+The pipeline performs these steps automatically:
+
+1. **Fetch Latest Code** - Gets the latest commit SHA from `main` branch
+2. **Build Images** - Builds Docker images with the commit SHA as tag
+3. **Push to Docker Hub** - Pushes images to Docker Hub
+4. **Download Configs** - Downloads docker-compose.yml and configs from main
+5. **Create Release Directory** - Creates timestamped release directory
+6. **Update Image Tags** - Updates docker-compose.yml with new image tags
+7. **Pull Images** - Pulls new images to EC2
+8. **Test Release** - Validates the new release
+9. **Blue-Green Switch** - Switches to new release with zero downtime
+10. **Health Check** - Verifies application is healthy
+11. **Keep Previous Release** - Preserves previous release for rollback
+
+### Manual Rollback
+
+If something goes wrong, you can manually rollback:
+
+```bash
+# SSH to your EC2 instance
+ssh -i your-key.pem ubuntu@YOUR_EC2_PUBLIC_IP
+
+# List available releases
+ls -la /home/ubuntu/releases/
+
+# Rollback to previous release
+cd /home/ubuntu/releases/myapp-release-TIMESTAMP
+docker-compose up -d
+
+# Or use your deploy.sh script
+./deploy/deploy.sh /home/ubuntu/releases/myapp-release-TIMESTAMP
+```
+
+### Monitoring Deployments
+
+**View deployment logs in GitHub Actions:**
+1. Go to GitHub → Actions tab
+2. Click on the workflow run
+3. Expand each step to see logs
+
+**View deployment on EC2:**
+```bash
+# SSH to EC2
+ssh -i your-key.pem ubuntu@YOUR_EC2_PUBLIC_IP
+
+# Check active containers
+docker-compose ps
+
+# View logs
+docker-compose logs -f
+
+# Check releases
+ls -lat /home/ubuntu/releases/
+```
+
+### Deployment Best Practices
+
+1. **Always test on main branch first** - The pipeline pulls code from main
+2. **Update deploy-trigger.txt to trigger deployment** - Only changes to this file trigger deployment
+3. **Monitor the first deployment** - SSH to EC2 and watch the process
+4. **Keep at least 3 releases** - For easy rollback
+5. **Set up CloudWatch** - For monitoring and alerts
+
+---
+
+## 🔧 Option 2: Manual Deployment
+
+If you prefer traditional manual deployment:
 
 ### Step 1: Create EC2 Instance
 
@@ -310,6 +609,53 @@ sudo ufw status
 ```
 
 ## 🔧 Troubleshooting
+
+### CI/CD Pipeline Issues
+
+**Workflow not triggering:**
+```bash
+# Make sure you're on the release branch
+git checkout release
+
+# Verify the file is tracked
+git status
+
+# Check if workflow file exists
+ls -la .github/workflows/release-deploy.yml
+```
+
+**AWS Credentials Error:**
+- Verify secrets are set in GitHub: Settings → Secrets → Actions
+- Check IAM user has correct permissions: `AmazonSSMFullAccess`
+- Verify AWS region matches in workflow file
+
+**SSM Connection Failed:**
+```bash
+# SSH to EC2 and check SSM agent
+sudo systemctl status amazon-ssm-agent
+
+# Restart SSM agent
+sudo systemctl restart amazon-ssm-agent
+
+# Verify IAM role is attached to EC2 instance
+aws ec2 describe-instances --instance-ids YOUR_INSTANCE_ID \
+  --query 'Reservations[0].Instances[0].IamInstanceProfile'
+```
+
+**Docker Image Pull Failed:**
+- Check Docker Hub credentials (if using private repos)
+- Verify image tags exist: `docker pull aarchtou/youraws-backend:COMMIT_SHA`
+- Check EC2 has internet access
+
+**Deployment Hangs:**
+```bash
+# SSH to EC2 and check what's running
+ps aux | grep docker
+docker ps -a
+
+# Check SSM command status in AWS Console
+# EC2 → Systems Manager → Run Command → Command history
+```
 
 ### Container Issues
 
@@ -478,11 +824,16 @@ MySQL data is stored in a named volume `mysql_data`:
 ## 📝 Submission Checklist
 
 - ✅ Live application URL: `http://YOUR_EC2_PUBLIC_IP`
-- ✅ GitHub repository: `<your-repo-url>`
+- ✅ GitHub repository with CI/CD pipeline
 - ✅ Docker Hub images:
   - `aarchtou/youraws-backend:latest`
   - `aarchtou/youraws-frontend:latest`
 - ✅ Complete documentation (this README)
+- ✅ Automated deployment pipeline:
+  - Blue-Green deployment strategy ✅
+  - GitHub Actions integration ✅
+  - AWS SSM deployment ✅
+  - Rollback capability ✅
 - ✅ All requirements met:
   - Frontend SPA with 2 pages ✅
   - Backend CRUD API ✅
@@ -492,18 +843,175 @@ MySQL data is stored in a named volume `mysql_data`:
   - Only port 80 exposed ✅
   - SSH restricted ✅
   - Bonus: Caching implemented ✅
+  - Bonus: CI/CD Pipeline ✅
+
+## 🔄 CI/CD Pipeline Summary
+
+### Pipeline Trigger
+```bash
+# Update and push to release branch
+git checkout release
+echo "Deploy $(date)" > deploy-trigger.txt
+git add deploy-trigger.txt
+git commit -m "chore: trigger deployment"
+git push origin release
+```
+
+### What Happens Automatically
+
+1. **GitHub Actions detects push to `release` branch**
+2. **Fetches latest commit SHA from `main` branch**
+3. **Builds Docker images** (backend and frontend)
+4. **Pushes images to Docker Hub** with commit SHA as tag
+5. **Connects to EC2 via AWS SSM** (no SSH keys needed!)
+6. **Downloads latest configs** from main branch
+7. **Creates timestamped release directory** on EC2
+8. **Updates docker-compose.yml** with new image tags
+9. **Pulls new Docker images** to EC2
+10. **Performs health checks** on new release
+11. **Switches to new release** (blue-green deployment)
+12. **Verifies deployment** with automated tests
+13. **Keeps previous release** for easy rollback
+
+### Deployment Flow Diagram
+
+```
+Developer                 GitHub                   AWS EC2
+    │                        │                        │
+    │  git push release      │                        │
+    ├───────────────────────▶│                        │
+    │                        │                        │
+    │                        │  Trigger Workflow      │
+    │                        ├────────┐               │
+    │                        │        │               │
+    │                        │  Build Images          │
+    │                        │        │               │
+    │                        │◀───────┘               │
+    │                        │                        │
+    │                        │  Push to Docker Hub    │
+    │                        ├───────────────────┐    │
+    │                        │                   │    │
+    │                        │◀──────────────────┘    │
+    │                        │                        │
+    │                        │  Deploy via SSM        │
+    │                        ├───────────────────────▶│
+    │                        │                        │
+    │                        │                        │  Pull Images
+    │                        │                        ├──────┐
+    │                        │                        │      │
+    │                        │                        │◀─────┘
+    │                        │                        │
+    │                        │                        │  Blue-Green
+    │                        │                        │  Switch
+    │                        │                        ├──────┐
+    │                        │                        │      │
+    │                        │                        │◀─────┘
+    │                        │                        │
+    │                        │  ✅ Deployment Success  │
+    │                        │◀───────────────────────┤
+    │                        │                        │
+    │  View live app         │                        │
+    ├────────────────────────┼───────────────────────▶│
+    │◀───────────────────────┼────────────────────────┤
+    │                        │                        │
+```
+
+### Rollback Procedure
+
+If you need to rollback to a previous version:
+
+```bash
+# SSH to EC2
+ssh -i your-key.pem ubuntu@YOUR_EC2_PUBLIC_IP
+
+# List all releases (sorted by date)
+ls -lat /home/ubuntu/releases/
+
+# Rollback to specific release
+cd /home/ubuntu/releases/myapp-release-20260114120000
+docker-compose down
+docker-compose up -d
+
+# Verify rollback
+docker-compose ps
+curl http://localhost/health
+```
+
+### Monitoring & Debugging
+
+**GitHub Actions Logs:**
+- Go to repository → Actions tab
+- Click on workflow run
+- View detailed logs for each step
+
+**EC2 Application Logs:**
+```bash
+ssh -i your-key.pem ubuntu@YOUR_EC2_PUBLIC_IP
+
+# View all container logs
+docker-compose logs -f
+
+# View specific service
+docker-compose logs -f backend
+docker-compose logs -f frontend
+
+# Check container status
+docker-compose ps
+
+# View releases
+ls -la /home/ubuntu/releases/
+```
+
+**SSM Command Logs:**
+```bash
+# On EC2
+ls -la /var/log/amazon/ssm/
+
+# View recent commands
+sudo cat /var/log/amazon/ssm/amazon-ssm-agent.log
+```
 
 ## 👨‍💻 Development Notes
 
 This application was built as a technical assessment demonstrating:
 - Full-stack development skills
 - Docker containerization
-- Cloud deployment
+- Cloud deployment (AWS EC2)
+- **CI/CD pipeline with GitHub Actions**
+- **Blue-Green deployment strategy**
+- **Infrastructure as Code**
+- **AWS Systems Manager integration**
 - Security best practices
 - Modern frontend patterns (SPA, caching)
 - RESTful API design
 - Database design and migrations
 - DevOps practices
+
+### Technology Choices
+
+**GitHub Actions for CI/CD:**
+- Free for public repositories
+- Native GitHub integration
+- Easy secret management
+- Powerful workflow automation
+
+**AWS SSM for Deployment:**
+- No SSH keys to manage
+- Better security
+- Audit trail of all commands
+- Works with private subnets
+
+**Blue-Green Deployment:**
+- Zero downtime deployments
+- Instant rollback capability
+- Safe production deployments
+- A/B testing support
+
+**Docker Hub:**
+- Public image registry
+- Version tagging with commit SHAs
+- Easy image distribution
+- CI/CD friendly
 
 ## 📄 License
 
